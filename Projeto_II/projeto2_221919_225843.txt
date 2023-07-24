@@ -1,0 +1,1237 @@
+/*#######################################################
+#                                                       #
+#               Projeto II - Datalogger                 #
+#                                                       #
+#     Mariane Martins                - RA:221919        #
+#     Wesna Simone Bulla de Araujo   - RA:225843        #
+#                                                       #
+#                                                       #
+#########################################################
+*/
+
+
+/*
+Esse projeto teve como objetivo construir um datalogger, isto é,
+um dispositivo que coleta dados ambientais, no caso a temperatura ambiente,
+e os armazena ao longo do tempo. Assim, explorou-se o conceito de
+máquina de estados, protocolo I2C, transmissão serial, bem como
+o uso de display LCD, display de sete segmentos, sensor de temperatura
+(LM35), expansor de portas (PCF8574), decodificador de display 
+de sete segmentos (CD4511B), teclado matricial e uma memória EEPROM (AT24C16).
+
+Com isso, o programa pode ser controlado pelo teclado matricial, em que algumas 
+teclas estão associadas a funções que o datalogger pode fazer, como:
+
+Tecla 1: Resetar a memória;
+Tecla 2: Exibir o status da memória (Quantidade de dados já gravados e ainda disponíveis);
+Tecla 3: Coletar valores de temperatura ambiente e armazenar na memória;
+Tecla 4: Finalizar coleta de dados;
+Tecla 5: Tranferir uma quantidade X de dados para serem mostrados via serial.
+Esse comando também exige que o usuário digite a quantidade de dados a ser tranferida.
+
+Além disso, esses comandos apenas serão executados caso o usuário confirme a ação
+ao clicar na tecla '#' ou cancele a ação ao clicar na tecla '*'.
+
+O tempo inteiro os valores de temperatura são mostrados no display (medições em tempo real).
+
+*/
+
+
+//Importa bibliotecas
+#include <LiquidCrystal.h>                     //Importa biblioteca para controlar o display 16x2
+#include <Wire.h>                               //Declara biblioteca de comunicação I2C
+
+//Declaração de variáveis
+#define L1 13                                 //Define pino relacionado a primeira linha do teclado matricial (linha 0)
+#define L2 7                                  //Define pino relacionado a segunda linha do teclado matricial (linha 1)
+#define L3 4                                  //Define pino relacionado a terceira linha do teclado matricial (linha 2)
+#define L4 3                                  //Define pino relacionado a quarta linha do teclado matricial (linha 3)
+#define C1 2                                  //Define pino relacionado a primeira coluna a esquerda do teclado matricial (coluna 0)
+#define C2 A0                                 //Define pino relacionado a segunda coluna do teclado matricial (coluna 1)
+#define C3 A1                                 //Define pino relacionado a terceira coluna a direita do teclado matricial (coluna 2)
+#define rs 6                                  //Define o pino responsável por selecionar a natureza do dado, isto é, comando ou configuração
+#define e 8                                   //Define pino reponsável por habilitar operações
+#define rw 9                                  //Define pino responsável pela leitura ou escrita. Se leitura o pino recebe 1, se escrita o pino recebe 0
+#define d4 10                                 //Define pino de dados. Note que foi escolhida a configuração de apenas 4 bits ao invés de 8 bits disponíveis no display
+#define d5 11                                 //
+#define d6 12                                 //
+#define d7 5                                  //
+#define temp A3                               //Define pino relacionado a saída do sensor de temperatura LM35
+#define add_I2C 0x50                          //endereço do escravo (Interface I2C)
+
+volatile int tempo = 0;                       //Define variável contador de tempo do debounce do teclado matricial que será utilizada dentro da interrupção. Inicializa variável em zero.
+int estado = 0;                               //Define variável relacionada a identificação do estado da máquina de estados. Inicializa pelo estado 0.
+int coluna = 0;                               //Define variável relaciona a identificação da coluna do teclado matricial. Inicializa a coluna em 0 (primeira coluna).
+char num = ' ';                               //Define variável relacionada ao caracter pressionado no teclado matricial. O default é espaço (não printa nada).
+int linhas = 0;                               //Define variável relaciona a identificação da linha do teclado matricial. Inicializa a linha em 0 (primeira linha).
+int coluna_ant = 0;                           //Define variável que irá receber o valor de leitura atual de qualquer uma das colunas para confirmar que a tecla foi pressionada. Inicializa em zero.
+char tecla;                                   //Define variável que irá receber o retorno do valor da tecla pressionada.
+
+
+//Inicializa o objeto LiquidCrystal com as informações de pinos
+LiquidCrystal lcd(rs, rw, e, d4, d5, d6, d7);
+
+
+volatile int periodo = 0;                       //Define variável para auxiliar na temporização do tempo de ativação dos displays
+volatile int tempo_temp = 0;                    //Define variável contador de tempo para medir a temperatura que também será utilizada dentro da interrupção. Inicializa variável em zero.
+int adc = 0;                                    //Define variável que irá receber o valor de leitura do sensor de temperatura. Inicializa a variável em zero.
+float V = 0.0;                                  //Define variável que irá receber o valor da tensão correspondente a temperatura medida. Inicializa a variável em zero.
+float temperatura = 0.0;                        //Define variável que irá receber o valor da temperatura a ser mostrada no display de sete segmentos. Inicializa a variável em zero.
+
+
+//Configura display de 7 segmentos e armazena em um vetor --> qual display será aceso?
+unsigned int display1 = 0b01110000;
+unsigned int display2 = 0b10110000;
+unsigned int display3 = 0b11010000;
+unsigned int display4 = 0b11100000;
+unsigned int display_seg[] = {display1, display2, display3, display4};
+
+int displays = 0;                               //Define variável que irá receber o código para acionar o display
+int count = 0;                                  //Define variavel para auxiliar no print do display
+String D = "0";                                 //Define variável do tipo string para separar os digitos recebidos pela temperatura
+int val[4] = {0, 0, 0, 0};                      //Define variável que irá armazenar a combinação do display e do digito a ser printado
+int c = 0;                                      //Define váriavel auxíliar;
+
+unsigned int add;                               //define a posição 5 da memória que irá receber o dado a ser armazenado
+int mask = 0;                                   //define a variável para funcionar como máscara para seleção dos bits de memória
+int add_escravo = 0;                            //define endereço do protocolo I2C somado com os 3 bits mais significativos do endereço de memória
+int add_memoria = 0;                            //define variável que irá armazenar os 8 bits restantes do endereço de memória
+int flag = 0;                                   //define variável que irá bloquear todas as funções do teclado, exceto a 4, quando a função anterior for a 3
+
+String msg = "Ola Datalogger!";                 //define mensagem de boas vindas (linha de cima do display)  
+String confirma = "O que deseja?";              //define mensagem de boas vindas (linha de baixo do display)
+//int posicao = 0;                                
+volatile int tempo_escrita = 0;                 //define variável para auxiliar na temporização de escrita no display LCD antes de retornar a mensagem de boas vindas
+int MSB, LSB;                                   //define variável para armazenar a parcela MSB e LSB da temperatura
+int pos1, pos2;                                 //define variável para armazenar o valor lido do contador de memória mais significativo e menos significativo.
+int valor;                                      //define variável para armazenar o valor a ser quebrado em MSB e LSB
+int flag_tecla = 0;                             //define variável que sinaliza se alguma tecla foi acionada
+int estado_tecla = 0;                           //define variável de estado da segunda máquina de estados que irá analisar o que fazer de acordo com a tecla pressionada
+char opcao;                                     //define variável para armazenar o valor da tecla que foi pressionada antes de apertar as teclas # ou *
+int caso = 0;                                   //define variável que permite ou não a entrada nos ifs do loop principal
+int boas_vindas = 0;                            //define flag de sinalização para controlar a ocorrência da mensagem de boas vindas
+int funcao = 0;                                 //define flag de sinalização para controlar a ocorrência de alguma mensagem antes de retornar a mensagem de boas vindas
+String dado_transferido;                        //define variável relacionada a quantidade de dados a serem transferidos
+//int result = 0;                                 //define variável que armazena a conversão de string para inteiro da quantidade de dado a ser transferido
+int dado_gravado, dado_disponivel;              //variáveis que armazenam a quantidade de dados gravados e disponíveis.
+int flag_transf = 0;                            //define variável para controlar as mensagens de erro ou cancelamento da função 5
+
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup() {
+    Serial.begin(9600);                         //Configura a taxa de transferência de bits para a comunicação serial. Ex:9600 bits por segundo
+    analogReference(INTERNAL);                  //Configura como tensão de referência do Arduino 1.1 V
+    pinMode(L1, OUTPUT);                        //Declara linha 0 do teclado matricial como saída, pois iremos modifica-los ao longo do programa
+    pinMode(L2, OUTPUT);                        //Declara linha 1 do teclado matricial como saída, pois iremos modifica-los ao longo do programa
+    pinMode(L3, OUTPUT);                        //Declara linha 2 do teclado matricial como saída, pois iremos modifica-los ao longo do programa
+    pinMode(L4, OUTPUT);                        //Declara linha 3 do teclado matricial como saída, pois iremos modifica-los ao longo do programa
+    pinMode(C1, INPUT_PULLUP);                  //Declara coluna 0 do teclado matricial como entrada com resistor de pull up, pois iremos lê-las ao longo do programa
+    pinMode(C2, INPUT_PULLUP);                  //Declara coluna 1 do teclado matricial como entrada com resistor de pull up, pois iremos lê-las ao longo do programa
+    pinMode(C3, INPUT_PULLUP);                  //Declara coluna 2 do teclado matricial como entrada com resistor de pull up, pois iremos lê-las ao longo do programa
+
+    cli();                                      //Desabilita as interrupções
+    configuracao_Timer0();                      //Configura o temporizador
+    sei();                                      //Habilita as interrupções
+
+    lcd.begin(16, 2);                           //Define o número de colunas e linhas a ser utilizada no display
+    LCD_setup(msg, confirma);                   //Chama a função responsável por printar o valor da tecla no display LCD
+    Wire.begin();                               //Inicializa o barramento I2C
+}
+
+//Módulo 2 - Teclado matricial
+//##################################################################################################################
+
+//Função responsável por habilitar cada uma das linhas do teclado matricial recebendo como argumento
+//linhas: indica qual linha deve ser acionada
+void linha(int linhas){
+  //se linhas igual 0 o pino L1 é setado para o nível lógico zero e os demais permanecem em nível lógico 1
+  //indicando que a primeira linha foi habilitada.
+  if(linhas == 0 ){                            
+    digitalWrite(L1, LOW);
+    digitalWrite(L2, HIGH);
+    digitalWrite(L3, HIGH);
+    digitalWrite(L4, HIGH);
+  }
+  //se linhas igual 1 o pino L2 é setado para o nível lógico zero e os demais permanecem em nível lógico 1
+  //indicando que a segunda linha foi habilitada.
+  else if(linhas == 1 ){
+    digitalWrite(L1, HIGH);
+    digitalWrite(L2, LOW);
+    digitalWrite(L3, HIGH);
+    digitalWrite(L4, HIGH);
+  }
+  //se linhas igual 2 o pino L3 é setado para o nível lógico zero e os demais permanecem em nível lógico 1
+  //indicando que a terceira linha foi habilitada.
+  else if(linhas == 2){
+    digitalWrite(L1, HIGH);
+    digitalWrite(L2, HIGH);
+    digitalWrite(L3, LOW);
+    digitalWrite(L4, HIGH);
+  }
+  //se linhas igual 0 o pino L4 é setado para o nível lógico zero e os demais permanecem em nível lógico 1
+  //indicando que a quarta linha foi habilitada.
+  else if(linhas == 3){
+    digitalWrite(L1, HIGH);
+    digitalWrite(L2, HIGH);
+    digitalWrite(L3, HIGH);
+    digitalWrite(L4, LOW);
+  }
+}
+
+//Função responsável por ler o valor atual do pino relacionado a cada coluna do teclado matricial recebendo como argumento
+//coluna: indica qual coluna deve ser lido
+int colunas(int coluna){
+    //se coluna igual 0 lê o valor atual da primeira coluna a esquerda e atribuiu o resultado a variável coluna_ant.
+    if (coluna == 0){
+      coluna_ant = digitalRead(C1);
+    }
+    //se coluna igual 1 lê o valor atual da segunda coluna (meio) e atribuiu o resultado a variável coluna_ant.
+    if (coluna == 1){
+      coluna_ant = digitalRead(C2);
+    }
+    //se coluna igual 2 lê o valor atual da terceira coluna a direita e atribuiu o resultado a variável coluna_ant.
+    if (coluna == 2){
+      coluna_ant = digitalRead(C3);
+    }
+  return coluna_ant;            //retorna o valor da leitura
+}
+//##################################################################################################################
+
+
+//Função responsável pela configuração da interrupção por TIMER
+void configuracao_Timer0(){
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 24;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+ 
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    1
+  TCCR0B = 0x05;
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+
+// Rotina de interrupção por TIMER:
+//A cada 1.6ms o programa principal é desviado para essa rotina que incrementa o contador tempo
+//Basicamente ao multiplicar o valor desse contador com o tempo de interrupção (1.6ms) tem-se o valor do tempo transcorrido.
+ISR(TIMER0_COMPA_vect){
+  tempo++;                                  //Incrementa contador de tempo relacionado ao tempo de debounce do teclado matricial
+  periodo++;                                //Incrementa contador de tempo relacionado ao calculo de tempo de ativação dos displays de sete segmentos
+  tempo_temp++;                             //Incrementa contador de tempo relacionado ao tempo de medição da temperatura
+  tempo_escrita++;                          //Incrementa contador de tempo relacionado ao tempo de escrita no display LCD antes de voltar para a tela de boas vindas
+
+  //Para garantir que os displays sempre fiquem acesos a variável periodo é zerada assim que atinge o valor 4, visto que há 4 displays (0, 1, 2, 3)
+  //e que estamos considerando um intervalo de ativação de 1,6ms (mesmo valor da interrupção por temporizador)
+  if(periodo == 4){
+    periodo = 0;    
+  }
+}
+
+
+//Função responsável por associar as linhas e as colunas com o respectivo caracter do teclado matricial. Essa função tem por argumentos
+//coluna: indica a coluna do teclado matricial
+//linhas: indica a linha do teclado matricial
+char digito(int coluna, int linhas){
+    if(linhas == 0 and coluna == 0){               //Se o par linhas e coluna for (0,0) indica que a tecla pressinada foi 1
+      num = '1';                                   //
+    }
+    else if (linhas == 0 and coluna == 1){         //Se o par linhas e coluna for (0,1) indica que a tecla pressinada foi 2
+      num = '2';                                   //
+    }
+    else if (linhas == 0 and coluna == 2){         //Se o par linhas e coluna for (0,1) indica que a tecla pressinada foi 3
+      num = '3';                                   //
+    }
+    else if (linhas == 1 and coluna == 0){         //Se o par linhas e coluna for (1,0) indica que a tecla pressinada foi 4
+      num = '4';                                   //
+    }
+    else if (linhas == 1 and coluna == 1){         //Se o par linhas e coluna for (1,1) indica que a tecla pressinada foi 5
+      num = '5';                                   //
+    }
+    else if (linhas == 1 and coluna == 2){         //Se o par linhas e coluna for (1,2) indica que a tecla pressinada foi 6
+      num = '6';                                   //
+    }
+    else if (linhas == 2 and coluna == 0){         //Se o par linhas e coluna for (2,0) indica que a tecla pressinada foi 7
+      num = '7';                                   //
+    }
+    else if (linhas == 2 and coluna == 1){         //Se o par linhas e coluna for (2,1) indica que a tecla pressinada foi 8
+      num = '8';                                   //
+    }
+    else if (linhas == 2 and coluna == 2){         //Se o par linhas e coluna for (2,2) indica que a tecla pressinada foi 9
+      num = '9';                                   //
+    }
+    else if (linhas == 3 and coluna == 0){         //Se o par linhas e coluna for (3,0) indica que a tecla pressinada foi *
+      num = '*';                                   //
+    }
+    else if (linhas == 3 and coluna == 1){         //Se o par linhas e coluna for (3,1) indica que a tecla pressinada foi 0
+      num = '0';                                   //
+    }
+    else if (linhas == 3 and coluna == 2){         //Se o par linhas e coluna for (3,2) indica que a tecla pressinada foi #
+      num = '#';                                   //
+    }
+    return num;                                    //retorna o valor da tecla
+}
+
+//Função responsável por exibir no display a tecla pressionada.
+//num: valor da tecla a ser exibida no display
+void LCD_setup (String msg, String confirma){
+    lcd.setCursor(0, 0);                          //Configura a coluna e a linha, repectivamente, onde a mensagem irá iniciar. Nesse caso, a mensagem irá aparecer na primeira linha do display
+    lcd.print(msg);                               //Printa uma mensagem
+    lcd.setCursor(0, 1);                          //Configura a coluna e a linha, repectivamente, onde a mensagem irá iniciar. Nesse caso, a mensagem irá aparecer na segunda linha do display
+    lcd.print(confirma);                          //Printa outra mensagem                          
+ }
+
+
+//Expansor de portas I2C
+//##################################################################################################################
+
+//Função responsável pela transmissão I2C para o display de 7 segmentos
+//val: valor a ser enviado pelo protocolo
+void transmissao(int val){
+    Wire.beginTransmission(32);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+                                               //Nesse caso foi utilizado o valor 32, pois corresponde a configuração das entradas A2=0 A1=0 A0=0 da interface I2C
+                                               //conforme o datasheet do CI PCF8574. Além disso, inicializa a transmissão (bit de início)
+
+    Wire.write(val);                           //Envia de fato o dado desejado
+    Wire.endTransmission();                    //Finaliza a transmissão com o envio do bit de parada
+}
+//##################################################################################################################
+
+
+//Acionamento de display via protocolo I2C
+//##################################################################################################################
+
+//Função responsável por converter um caracter em valor binário inteiro
+//e combinar (somar) com o correto display ao receber como parâmetros
+//display: codigo que identifica o correto display
+//D: digito a ser combinado com o código do display
+//A função retorna o valor a ser enviado pelo protocolo I2C
+int sete_segmento(int displays, char D){
+    if (D == '0' ){
+      D = 0b00000000;
+    }
+    else if (D == '1'){
+      D = 0b00000001;
+    }
+    else if (D == '2'){
+       D = 0b00000010;
+    }
+     else if (D == '3'){
+       D = 0b00000011;
+    }
+    else if (D == '4'){
+      D = 0b00000100;
+    }
+    else if (D == '5'){
+      D = 0b00000101;
+    }
+    else if (D == '6'){
+      D = 0b00000110;
+    }
+    else if (D == '7'){
+       D = 0b00000111;
+    }
+    else if (D == '8'){
+       D = 0b00001000;
+    }
+    else if (D == '9'){
+       D = 0b00001001;
+    }
+ 
+    return (displays + int(D));
+}
+
+//Módulo 3 - Sensor de Temperatura
+//##################################################################################################################
+
+//Função responsável por acender os display com os valores desejados extraidos da temperatura e
+//controlar o tempo de ativação de cada display.
+//utilizou-se como tempo de ativação 1,6ms, pois um periodo completo (6,4ms) já é bem menor que 33,3ms (valor de partida para que não seja possível
+//perceber que os displays não estão acesos ao mesmo tempo)
+void mostra_temperatura(){
+  if (periodo == 0){                            //espera 1,6ms
+    transmissao(val[0]);                        //chama a função que irá transmitir o valor a ser printado para o display. Note que o primeiro valor a ser transmitido
+                                                //na verdade diz respeito ao ultimo display, mas como visualmente os displays estarão acesos ao mesmo tempo
+                                                //isso não irá afetar os resultados.
+  }
+  else if (periodo == 1){                       //espera 3,2ms
+    transmissao(val[1]);                        //
+  }
+  else if (periodo == 2){                       //espera 4,8ms
+    transmissao(val[2]);                        //
+  }
+  else if (periodo == 3){                       //espera 6,4ms
+    transmissao(val[3]);                        //
+  }
+}
+
+// Função que mede o valor da temperatura ambiente
+float mede_temperatura() {
+  if (tempo_temp >= 1250){                                     //Se a contagem de tempo for maior ou igual a 1250, isto é, passaram-se 2s
+
+    //Atualização do valor de temperatura    
+    adc = analogRead(temp);                                    //o pino analógico do sensor de temperatura é lido (conversor ADC)
+    V = (1.1 * adc)/1024;                                      //o valor lido é convertido em tensão dentro de uma escala de 0 a 1.1V.
+    temperatura = V/(0.01);                                    //a tensão é convertida para temperatura (1°C = 10mV)
+
+
+    //Atualização do valor do display a cada 2s    
+    D = String(int(temperatura*100));                           //Converte a temperatura em inteiro e depois converte em string para separar os digitos.                                                         
+                                                                //Note que a temperatura foi multiplicada por 100 para facilitar a exibição nos 4 displays de sete segmentos
+    count = D.length() - 1;                                     //calcula o comprimento da string e subtrai um para definir o valor da última posição do vetor D
+   
+    //Para garantir que os digitos separados sejam corretamente posicionados em determinados displays
+    //combina-se o par display e digito D de modo que o último display sempre será combinado com o último elemento do vetor D,
+    //o penultimo display com o penultimo elemento e assim por diante. Isso garante que valores de temperatura com menos de 4 digitos também sejam
+    //corretamente posicionados. Basicamente seria como printar no display de trás para frente.
+    for(c=3;c >= 0;c--){                                        //c = 3 pois considera a quantidade de indices dos displays disponíveis (0, 1, 2, 3)                
+      val[c] = sete_segmento(display_seg[c], D[count]);         //chama a função que irá combinar display com digito
+      count--;                                                  //decrementa para passar para o próximo elemento de trás para frente
+    }  
+    //As variáveis globais que também são utilizadas na interrupção são zeradas para reiniciar a contagem
+    tempo_temp = 0;
+  }
+   return temperatura;                                          //retorna a temperatura
+}
+//##################################################################################################################
+
+
+//Módulo 1 - Leitura e escrita na memória EEPROM
+//##################################################################################################################
+//Função responsável por escrever um caracter qualquer em uma posição de memória qualquer ao receber como parâmetros:
+//add: endereço da memória em que se deseja armazenar um valor qualquer. Note que foi escolhido o tipo "unsigned int", pois o endereço de
+//memória possui 11 bits o que se adequa ao tipo int que comporta 2bytes (16 bits). Além disso, como as posições de memória são representadas por
+//apenas valores positivos utilizou-se o unsigned.
+//dado: valor a ser escrito na memória. Nesse caso foi escolhido como o tipo da variável o "unsigned char", pois diferente do endereço de memória
+//os valores que serão armazenados serão formados por 1 byte (8 bits) que é suportado pelo tipo char. Além disso, como apenas valores positivos serão considerados
+//utilizou-se o unsigned também.
+void escrever(unsigned int add, unsigned char dado)
+{
+  //preparação do endereço do escravo e do endereço de memória a ser enviado pelo barramento I2C, dado que o protocolo I2C envia apenas 8 bits
+  //por vez e o endereço de memória possui 11 bits.
+  mask = add & 0b11100000000;                         //seleciona os 3 bits mais significativos do endereço de memória de 11 bits      
+  mask = (mask>>8);                                   //desloca o resultado anterior 8 vezes para a direita tornado os 3 bits mais significativos em menos significativos
+  add_escravo = add_I2C + mask;                       //soma o endereço fixo do escravo com a mascara obtendo o novo endereço do escravo que contém partes do endereço de memória
+  add_memoria = add & 0b00011111111;                  //seleciona os 8 bits finais do endereço de memória de 11 bits
+
+
+  Wire.beginTransmission(add_escravo);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+  Wire.write(add_memoria);                            //escreve no barramento os 8 bits finais do endereço de memória, visto que os 3 primeiros bits já
+                                                      //foram embutidos no endereço do escravo enviado anteriormente.
+  Wire.write(dado);                                   //escreve no barramento o dado a ser registrado na posição de memória sinalizada anteriormente
+  Wire.endTransmission();                             //Finaliza a transmissão
+}
+
+//Função responsável por ler o conteúdo de uma posição de memória qualquer ao receber como parâmetro:
+//add: endereço da memória em que se deseja ler o conteúdo. Note que foi escolhido o tipo "unsigned int", pois o endereço de
+//memória possui 11 bits o que se adequa ao tipo int que comporta 2 bytes (16 bits). Além disso, como as posições de memória são representadas por
+//apenas valores positivos utilizou-se o unsigned.
+//Note também que a função foi declarada como "unsigned char", pois ela irá retornar o valor do dado armazenado que no geral possui 1 byte (8 bits) apenas de valores
+//positivos.
+unsigned char ler(unsigned int add)
+{
+  char dado_lido = 0;                                 //define variável local que armazena o dado lido
+  //Serial.println(add);
+  //preparação do endereço do escravo e do endereço de memória a ser enviado pelo barramento I2C para o processo de leitura, dado que o protocolo
+  //I2C envia apenas 8 bits por vez e o endereço de memória possui 11 bits.
+  mask = add & 0b11100000000;                         //seleciona os 3 bits mais significativos do endereço de memória de 11 bits      
+  mask = (mask>>8);                                   //desloca o resultado anterior 8 vezes para a direita tornado os 3 bits mais significativos em menos significativos
+  add_escravo = add_I2C + mask;                       //soma o endereço fixo do escravo com a mascara obtendo o novo endereço do escravo que contém partes do endereço de memória
+  add_memoria = add & 0b00011111111;                  //seleciona os 8 bits finais do endereço de memória de 11 bits
+
+
+   Wire.beginTransmission(add_escravo);               //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+   Wire.write(add_memoria);                           //escreve no barramento os 8bits finais do endereço de memória, visto que os 3 primeiros bits já
+                                                      //foram embutidos no endereço do escravo enviado anteriormente.
+   Wire.endTransmission();                            //Finaliza a transmissão
+   Wire.requestFrom(add_escravo,1);                   //Sinaliza a memoria que espera-se dado de 1 byte, passando o endereço do escravo
+
+
+   if (Wire.available()){                             //se houver bytes disponíveis para leitura
+     dado_lido = Wire.read();                         //lê o valor
+  }
+
+
+  return dado_lido;                                   //retorna o valor
+}
+//##################################################################################################################
+
+//Função responsável por separar um valor recebido em bits mais significativos (MSB) e bits menos significativos (LSB) ao receber como parâmetro:
+//valor: valor numérico que se deseja separar em bits mais significativos e menos significativos
+int dado_MSB_LSB(float valor){
+  int dado_temp = int(valor);                       //converte valor recebido, por exemplo temperatura, em inteiro
+  int LSB = dado_temp & 0b0000000011111111;         //seleciona os bits menos significativos do valor enviado (8 ultimos bits)
+  int MSB = dado_temp >> 8;                         //seleciona os bits mais significativos do valor enviado (8 primeiros bits)
+                          
+  return (MSB, LSB);                                //retorna os valores MSB e LSB
+}
+
+//Função responsável por converter string para inteiro ao receber como parâmetro
+//dado_transferido: string a ser convertida em inteiro. Por exemplo, a quantidade de dados a ser transferido que vem na forma de string
+int str_to_int(String dado_transferido){
+    int Size = dado_transferido.length();           //tamanho da string que será utilizado para analisar cada caracter que a forma
+    int i = 0;                                      //define variável auxiliar
+    int result = 0;                                 //define variável que armazena a conversão de string para inteiro da quantidade de dado a ser transferido
+
+    //Identifica cada caracter que forma a string e o converte em um valor inteiro somando com o resultado anterior
+    for (i=0; i<Size; i++){
+        if (dado_transferido[i] == '0'){
+            result = result * 10 + 0;
+        }
+        if (dado_transferido[i] == '1'){
+            result = result * 10 + 1;
+        }
+        if (dado_transferido[i] == '2'){
+            result = result * 10 + 2;
+        }
+        if (dado_transferido[i] == '3'){
+            result = result * 10 + 3;
+        }
+        if (dado_transferido[i] == '4'){
+            result = result * 10 + 4;
+        }
+        if (dado_transferido[i] == '5'){
+            result = result * 10 + 5;
+        }
+        if (dado_transferido[i] == '6'){
+            result = result * 10 + 6;
+        }
+        if (dado_transferido[i] == '7'){
+            result = result * 10 + 7;
+        }
+        if (dado_transferido[i] == '8'){
+            result = result * 10 + 8;
+        }
+        if (dado_transferido[i] == '9'){
+            result = result * 10 + 9;
+        }
+    }
+    return result;                                       //retorna a transformação
+}
+
+//Função responsável por mostrar o status de armazenamento da memória, isto é, quantos dados foram gravados e quantos ainda estão disponíveis
+void status(){
+
+      dado_gravado = ler(2046) & 0b0000000011111111;        //lê o valor do contador de memória mais significativo
+      dado_gravado = dado_gravado << 8;                     //desloca o valor lido em 8 bits para a esquerda
+      dado_gravado = (dado_gravado + ler(2047));            //esse valor é somado com o conteúdo lido do contador de memória menos significativo
+                                                            //assim tem-se o valor do contador de memória que corresponde a quantidade de dados gravados.
+                                                            //note que esse procedimento foi necessário, pois os conteudos salvos na memória são separados em MSB e LSB.
+      dado_disponivel = (1022 - dado_gravado);              //subtrai-se o valor total que pode ser armazenado pelo valor gravado, obtendo assim o valor disponível
+}
+
+//Função responsável por armazenar na memória os dados coletados de temperatura. Recebe como parâmetro
+//temperatura: valor de temperatura a ser armazenado
+void coleta_dados(float temperatura){
+
+      int pos_atual = 0;                                    //define variável para armazenar a posição atual da memória livre para o armazenamento
+      
+      MSB, LSB = dado_MSB_LSB(temperatura*10);              //chama a função para dividir o valor da temperatura em MSB e LSB.
+                                                            //a temperatura foi multiplicada por 10 para armazenar na memória os 3 principais digitos da temperatura
+      pos1 = ler(2046);                                     //lê o contador de memória mais significativo
+      pos2 = ler(2047);                                     //lê o contador de memória menos significativo
+      pos_atual = 2 * ((256 * pos1) + pos2);                //calcula com base nas leituras o valor da posição de memória que pode ser utilizado para armazenar um novo dado
+
+      //processo de escrita na memória para armazenar o novo dado
+      escrever(pos_atual, MSB);                             //escreve primeiro a parte MSB da nova temperatura
+      _delay_ms(5);                                         //espera 5 ms para o processo de escrita se completar
+      escrever(pos_atual+1, LSB);                           //escreve a parte LSB da nova temperatura e na posição seguinte a posição calculada anteriormente
+      _delay_ms(5);                                         //espera 5 ms para o processo de escrita se completar
+
+      //processo de atualização do contador de memória
+      if(pos1 == 0){                                        //verifica se o valor mais significativo da memória é igual a zero
+          pos2 = pos2 + 1;                                  //se for, incrementa somente o conteúdo referente a parte LSB
+      }
+      else{                                                 //se não, incrementa tanto a parte LSB quanto a parte MSB
+          pos1 = pos1 + 1;                                  //
+          pos2 = pos2 + 1;                                  //
+      }
+
+      //processo de escrita na memória para armazenar o novo valor do contador de memória
+      escrever(2046, pos1);                                 //escreve primeiro a parte MSB do novo valor do contador
+       _delay_ms(5);                                        //espera 5 ms para o processo de escrita se completar
+      escrever(2047, pos2);                                 //escreve a parte LSB do novo valor do contador
+       _delay_ms(5);                                        //espera 5 ms para o processo de escrita se completar
+  
+}
+
+//Função responsável por transferir (printar pela serial) uma certa quantidade de valores de temperatura coletados anteriormente
+//e que foram armazenados na memória.
+void transfere_dados(){
+    int valor_inteiro = 0;                                  //variável que recebe o valor da conversão string --> inteiro
+    int d = 0;                                              //variável auxiliar
+    int conteudo_msb = 0;                                   //variável que armazena o valor MSB da temperatura
+    int conteudo_lsb = 0;                                   //variável que armazena o valor LSB da temperatura
+    int pos_memoria = 0;                                    //variável que irá definir as posições de memória a ser acessada
+    float conteudo_total = 0;                               //variável que irá armazenar o valor MSB + LSB da temperatura
+
+    valor_inteiro = str_to_int(dado_transferido);           //chama a função para converter a quantidade de dados que se deseja transferir em inteiro
+
+    //lê cada posição de memória até o valor_inteiro e printa na serial
+    for(d = 0; d < valor_inteiro; d++){                     
+          pos_memoria = 2*d;                                                              //define a posição de memoria a ser acessada
+          conteudo_msb = ler(pos_memoria);                                                //lê o conteúdo MSB
+          conteudo_lsb = ler(pos_memoria+1);                                              //lê o conteúdo LSB da próxima posição 
+          conteudo_total = ((conteudo_msb & 0b0000000011111111) << 8) + conteudo_lsb;     //junta o conteudo MSB + LSB
+          Serial.println(conteudo_total/10);                                              //printa na serial as temperaturas armazenadas
+    }
+  dado_transferido = "";                                                                  //ao final limpa a quantidade de dados transferidos
+}
+
+//Função responsável por limpar a memória, isto é, zerar o contador para que novos dados subscrevam os dados antigos
+void reseta_memoria(){
+
+    MSB, LSB = dado_MSB_LSB(0);                           //chama a função para dividir o valor zero em MSB e LSB.
+    escrever(2046, MSB);                                  //escreve zero na parte MSB do contador
+    _delay_ms(5);                                         //espera 5 ms para o processo de escrita se completar
+    escrever(2047, LSB);                                  //escreve zero na parte LSB do contador
+    _delay_ms(5);                                         //espera 5 ms para o processo de escrita se completar
+}
+
+//Programa principal --> Máquina de Estados
+void loop(){
+ 
+ //Máquina de estados para a varredura do teclado matricial
+  switch (estado){
+    //Estado 0
+    case 0:
+        //Se nenhuma coluna estiver pressionada (leitura dos pinos deve ser igual a 1) e a linha analisada for 0
+        //atribui-se a variável estado valor 1 (pula para o próximo estado) e configura a linha 1    
+        if (digitalRead(C1)==1 and digitalRead(C2)==1 and digitalRead(C3)==1 and linhas == 0){
+            estado = 1;
+            linhas = 1;
+            linha(linhas);
+        }
+        //Se qualquer coluna estiver pressionada (leitura de um dos pinos deve ser igual a 0) e a linha analisada for 0
+        //atribui-se a variável estado valor 4 (estado de debounce) e configura a linha 0.
+        //Além disso, verifica qual coluna da linha 0 foi pressionada (qual coluna é diferente de 1) e atribui um valor que identifica essa coluna                
+        if ((digitalRead(C1)!=1 or digitalRead(C2)!=1 or digitalRead(C3)!=1) and linhas == 0){
+            estado = 4;
+            linhas = 0;
+            linha(linhas);
+
+            //Identifica qual coluna foi pressionada
+            if (digitalRead(C1)!=1){
+              coluna = 0;
+            }
+
+            if (digitalRead(C2)!=1){
+              coluna = 1;
+            }
+
+            if (digitalRead(C3)!=1){
+              coluna = 2;
+            }
+        }
+        break;
+
+    //Estado 1
+    case 1:
+        //Se nenhuma coluna estiver pressionada (leitura dos pinos deve ser igual a 1) e a linha analisada for 1
+        //atribui-se a variável estado valor 2 (pula para o próximo estado) e configura a linha 2
+        if (digitalRead(C1)==1 and digitalRead(C2)==1 and digitalRead(C3)==1 and linhas == 1){
+            estado = 2;
+            linhas = 2;
+            linha(linhas);
+        }
+        //Se qualquer coluna estiver pressionada (leitura de um dos pinos deve ser igual a 0) e a linha analisada for 1
+        //atribui-se a variável estado valor 4 (estado de debounce) e configura a linha 1.
+        //Além disso, verifica qual coluna da linha 1 foi pressionada (qual coluna é diferente de 1) e atribui um valor que identifica essa coluna
+        if ((digitalRead(C1)!=1 or digitalRead(C2)!=1 or digitalRead(C3)!=1) and linhas == 1){
+            estado = 4;
+            linhas = 1;
+            linha(linhas);
+
+            //Identifica qual coluna foi pressionada
+            if (digitalRead(C1)!=1){
+              coluna = 0;
+            }
+
+            if (digitalRead(C2)!=1){
+              coluna = 1;
+            }
+
+            if (digitalRead(C3)!=1){
+              coluna = 2;
+            }
+        }
+        break;
+
+    //Estado 2
+    case 2:
+        //Se nenhuma coluna estiver pressionada (leitura dos pinos deve ser igual a 1) e a linha analisada for 2
+        //atribui-se a variável estado valor 3 (pula para o próximo estado) e configura a linha 3
+        if (digitalRead(C1)==1 and digitalRead(C2)==1 and digitalRead(C3)==1 and linhas == 2){
+            estado = 3;
+            linhas = 3;
+            linha(linhas);
+        }
+        //Se qualquer coluna estiver pressionada (leitura de um dos pinos deve ser igual a 0) e a linha analisada for 2
+        //atribui-se a variável estado valor 4 (estado de debounce) e configura a linha 2.
+        //Além disso, verifica qual coluna da linha 2 foi pressionada (qual coluna é diferente de 1) e atribui um valor que identifica essa coluna
+        if ((digitalRead(C1)!=1 or digitalRead(C2)!=1 or digitalRead(C3)!=1) and linhas == 2){
+            estado = 4;
+            linhas = 2;
+            linha(linhas);
+
+            //Identifica qual coluna foi pressionada
+            if (digitalRead(C1)!=1){
+              coluna = 0;
+            }
+            if (digitalRead(C2)!=1){
+              coluna = 1;
+            }
+            if (digitalRead(C3)!=1){
+              coluna = 2;
+            }
+        }
+        break;
+
+    //Estado 3
+    case 3:
+        //Se nenhuma coluna estiver pressionada (leitura dos pinos deve ser igual a 1) e a linha analisada for 3
+        //atribui-se a variável estado valor 0 (pula para o próximo estado) e configura a linha 0.
+        //Note que o estado 3 fecha o ciclo de varredura, retornando novamente para o estado inicial.        
+        if (digitalRead(C1)==1 and digitalRead(C2)==1 and digitalRead(C3)==1 and linhas == 3){
+            estado = 0;
+            linhas = 0;
+            linha(linhas);
+        }
+        //Se qualquer coluna estiver pressionada (leitura de um dos pinos deve ser igual a 0) e a linha analisada for 3
+        //atribui-se a variável estado valor 4 (estado de debounce) e configura a linha 3.
+        //Além disso, verifica qual coluna da linha 3 foi pressionada (qual coluna é diferente de 1) e atribui um valor que identifica essa coluna
+        if ((digitalRead(C1)!=1 or digitalRead(C2)!=1 or digitalRead(C3)!=1) and linhas == 3){
+            estado = 4;
+            linhas = 3;
+            linha(linhas);
+
+            //Identifica qual coluna foi pressionada
+            if (digitalRead(C1)!=1){
+              coluna = 0;
+            }
+            if (digitalRead(C2)!=1){
+              coluna = 1;
+            }
+            if (digitalRead(C3)!=1){
+              coluna = 2;
+            }
+        }
+        break;
+
+    //Estado 4
+    case 4:
+        estado = 5;                 //Transita para o estado 5 e
+        tempo = 0;                  //atribui a variável tempo (interrupção por temporizador) o valor zero para auxiliar na verificação do debounce
+        break;
+
+    //Estado 5
+    case 5:
+    //Verifica se de fato a tecla foi pressionada
+        //se o tempo for menor que 32 (o que indica 50ms) o programa continua no estado 5
+        if (tempo<32){
+            estado = 5;
+        }
+        //se o tempo for maior ou igual a 32 e a leitura atual relacionada ao pino da coluna, que foi identificado em um dos estados anteriores
+        //(0, 1, 2 ou 3), for igual a zero (o que indica que a coluna foi realmente pressionada)
+        //o fluxo do programa vai para o estado 6 mas antes identifica qual foi a tecla pressionada com base nos valores da linha e coluna
+        //também provenientes de um dos estados anteriores (0, 1, 2 ou 3). O valor da tecla é mostrado em um display LCD.        
+        if (tempo>=32 and colunas(coluna)==0){
+            estado = 6;
+            tecla = digito(coluna,linhas);
+            flag_tecla = 1;                         //sinaliza que uma tecla foi apertada
+
+        }
+        //se o tempo for maior ou igual a 32 e a leitura atual relacionada ao pino da coluna, que foi identificado em um dos estados anteriores
+        //(0, 1, 2 ou 3), ainda for igual a 1 isso indica que a coluna na verdade não foi pressionada (foi apenas um ruido). Então, o programa
+        //retorna para o estado zero e linha 0 e recomeça a varredura
+        if (tempo>=32 and colunas(coluna)!=0){
+            estado = 0;
+            linhas = 0;
+            linha(linhas);
+        }
+        break;
+ 
+      //Estado 6
+      case 6:
+        estado = 7;                 //Transita para o estado 7 e
+        tempo = 0;                  //atribui a variável tempo (interrupção por temporizador) o valor zero para auxiliar na verificação do debounce
+        break;
+
+      //Estado 7
+      case 7:
+        //Verifica se de fato a tecla foi solta
+          //se o tempo for menor que 32 (o que indica 50ms) o programa continua no estado 6
+          if (tempo<32){
+              estado = 7;
+          }
+          //se o tempo for maior ou igual a 32 e a leitura atual relacionada ao pino da coluna, que foi identificado em um dos estados anteriores
+          //(0, 1, 2 ou 3), for igual a 1 (o que indica que a coluna foi realmente solta)
+          //o fluxo do programa vai para o estado inicial 0 e configura a linha para zero
+          if (tempo>=32 and colunas(coluna)!=0){
+              estado = 0;
+              linhas = 0;
+              linha(linhas);
+          }
+          //se o tempo for maior ou igual a 32 e a leitura atual relacionada ao pino da coluna, que foi identificado em um dos estados anteriores
+          //(0, 1, 2 ou 3), ainda for igual a 0 isso indica que a coluna na verdade não foi solta. Então, o programa continua no estado 6
+          if (tempo>=32 and colunas(coluna)==0){
+              estado = 7;
+          }
+          break;
+  }
+
+  //Máquina de estados para a decodificação dos comando referente as teclas  
+  switch(estado_tecla){ 
+
+    //estado 0     
+    case 0:
+      //Se flag_tecla for igual a zero (nenhuma tecla foi apertada), o display LCD mostra uma mensagem de boas vindas
+      //e atribui a variável estado_tecla o valor zero. Note que a mensagem do display será printado uma única vez (embora continue aparecendo no display).
+      if(flag_tecla == 0){
+            if (boas_vindas == 0){
+                msg = "Ola Datalogger! ";
+                confirma = "O que deseja?   ";
+                LCD_setup(msg, confirma);
+                boas_vindas = 1;
+            }
+            estado_tecla = 0;
+      }
+
+      //Se flag_tecla for igual a 1 (alguma tecla foi apertada) e tecla for igual a '1'
+      //confere se a variável flag é diferente de 1 (quer dizer que o estado anterior não era o 3 --> coleta de dados)
+      //Se sim, printa mensagem mostrando o nome da função, guarda o valor da tecla pressionada, zera novamente a flag_tecla e faz estado_tecla igual a 'c'
+      //Se não, nada acontece
+      if((flag_tecla == 1) && (tecla == '1')){
+          if(flag != 1){
+
+              msg = "Reset           ";
+              confirma = "Sim # ou Nao *  ";      
+              LCD_setup(msg, confirma);
+
+              opcao = tecla;
+              flag_tecla = 0;
+              estado_tecla = 'c';                               //manda para o estado de confirmação
+
+        }
+      } 
+
+      //Se flag_tecla for igual a 1 (alguma tecla foi apertada) e tecla for igual a '2'
+      //confere se a variável flag é diferente de 1 (quer dizer que o estado anterior não era o '3' --> coleta de dados)
+      //Se sim, printa mensagem mostrando o nome da função, guarda o valor da tecla pressionada, zera novamente a flag_tecla e faz estado_tecla igual a 'c'
+      //Se não, nada acontece
+      if((flag_tecla == 1) && (tecla == '2')){
+        if(flag != 1){
+
+            msg = "Status          ";
+            confirma = "Sim # ou Nao *  ";      
+            LCD_setup(msg, confirma);
+
+            opcao = tecla;
+            flag_tecla = 0;
+            estado_tecla = 'c';                                 //manda para o estado de confirmação
+        }
+      }       
+
+      //Se flag_tecla for igual a 1 (alguma tecla foi apertada) e tecla for igual a '3'
+      //confere se a variável flag é diferente de 1 (quer dizer que o estado anterior não era o '3' --> coleta de dados)
+      //Se sim, printa mensagem mostrando o nome da função, guarda o valor da tecla pressionada, zera novamente a flag_tecla e faz estado_tecla igual a 'c'
+      //Se não, nada acontece
+      if((flag_tecla == 1) && (tecla == '3')){
+         if(flag != 1){
+
+            msg = "Coleta de Dados ";
+            confirma = "Sim # ou Nao *  ";      
+            LCD_setup(msg, confirma);
+
+            opcao = tecla;
+            flag_tecla = 0;
+            estado_tecla = 'c';                               //manda para o estado de confirmação
+         }
+      } 
+
+      //Se flag_tecla for igual a 1 (alguma tecla foi apertada) e tecla for igual a '4'
+      //printa mensagem mostrando o nome da função, guarda o valor da tecla pressionada, zera novamente a flag_tecla e faz estado_tecla igual a 'c'
+      //Note que no caso '4' não é preciso conferir o estado da variável flag, pois o estado '4' é o único que deveria ser acionado após
+      //o acionamento do estado '3' para poder finalizar a coleta      
+      if((flag_tecla == 1) && (tecla == '4')){
+
+          msg = "Fim da Coleta   ";
+          confirma = "Sim # ou Nao *  ";      
+          LCD_setup(msg, confirma);
+
+          opcao = tecla;
+          flag_tecla = 0;
+          estado_tecla = 'c';                                 //manda para o estado de confirmação
+      } 
+
+      //Se flag_tecla for igual a 1 (alguma tecla foi apertada) e tecla for igual a '5'
+      //confere se a variável flag é diferente de 1 (quer dizer que o estado anterior não era o '3' --> coleta de dados)
+      //Se sim, printa mensagem mostrando o nome da função, guarda o valor da tecla pressionada, zera novamente a flag_tecla e faz estado_tecla igual a 'c'
+      //Se não, nada acontece
+      if((flag_tecla == 1) && (tecla == '5')){
+        if(flag != 1){
+          
+            msg = "Transf. Dados   ";
+            confirma = "Sim # ou Nao *  ";      
+            LCD_setup(msg, confirma);
+
+            opcao = tecla;
+            flag_tecla = 0;
+            estado_tecla = 'c';                           //manda para o estado de confirmação
+        }
+      } 
+      break;
+   
+    //estado 1 --> Reseta memória
+    case 1:
+        //Função referente a tecla 1 confirmada
+        //enquanto o tempo_escrita for menor que 2s (1250) printa uma mensagem no display LCD mostrando que a ação de apagar a memória está acontecendo
+        //e continua no estado 1
+        //aqui essa mensagem também será printada uma única vez, embora permaneça no display LCD         
+        if(tempo_escrita < 1250){
+            if(funcao == 0){
+              msg = "Apagando...     ";
+              confirma = "                ";      
+              LCD_setup(msg, confirma);
+              funcao = 1;
+            }
+            estado_tecla = 1;
+            
+        }
+        //após os 2s a variável caso recebe 1 e as variáveis estado_tecla, boas_vindas e funcao são resetadas
+        else{
+            caso = 1;
+            estado_tecla = 0;
+            boas_vindas = 0;
+            funcao = 0;
+        }    
+      break;
+
+    //estado 2 --> Status da memória
+    case 2:
+         //Função referente a tecla 2 confirmada
+         //a variável caso recebe 2 e estado_tecla recebe zero (retorno ao estado 0, mas sem habilitar a mensagem de boas vindas)
+         caso = 2;
+         estado_tecla = 0; 
+      break;
+
+    //estado 3 --> Coleta de dados
+    case 3:
+        //Função referente a tecla 3 confirmada
+        //mostra mensagem de confirmação da coleta de dados
+        //a variável caso recebe 3, a variavel flag recebe 1 (indicativo de que o estado acionado é o 3)
+        //e estado_tecla recebe zero (retorno ao estado zero)
+        msg = "Coletando...   ";
+        confirma = "                ";      
+        LCD_setup(msg, confirma);
+        caso = 3;
+        flag = 1;
+        estado_tecla = 0;
+      break;
+
+    //estado 4 --> Fim da coleta de dados
+    case 4:
+        //Função referente a tecla 4 confirmada
+        //enquanto o tempo_escrita for menor que 2s (1250) printa uma mensagem no display LCD mostrando que a ação encerrar coleta de dados está acontecendo
+        //e continua no estado 4
+        //aqui essa mensagem também será printada uma única vez, embora permaneça no display LCD 
+        if(tempo_escrita < 1250){
+            if(funcao == 0){
+              msg = "Fim da Coleta!  ";
+              confirma = "                ";      
+              LCD_setup(msg, confirma);
+              funcao = 1;
+            }
+            estado_tecla = 4;
+            
+        }
+        //após os 2s a variável caso recebe 4 e as variáveis estado_tecla, boas_vindas e funcao são resetadas
+        else{
+            caso = 4;
+            estado_tecla = 0;
+            boas_vindas = 0;
+            funcao = 0;
+        }
+      break;
+
+    //estado 5 --> Tranferencia de dados
+    case 5:
+        //Função referente a tecla 5 confirmada
+
+        //se flag_tecla for igual a zero (nenhuma tecla foi pressionada) fica no estado 5
+        if(flag_tecla == 0){
+            estado_tecla = 5;
+        }
+
+        //se flag_tecla for igual a 1 e tecla for diferente de # e diferente de *
+        //uma mensagem aparece no LCD para que o usuário digite quantos dados ele deseja tranferir (ler da memoria e printar na serial)
+        if((flag_tecla == 1) && (tecla != '#') && (tecla != '*')){
+
+           //concatena as teclas apertadas pelo usuário antes que um #(confirma) ou *(cancela) seja pressionado
+           dado_transferido = dado_transferido + tecla; 
+           
+           //mensagem
+            msg = "Qtd. de 1 a 1023";
+            confirma = dado_transferido + " Sim # Nao *";      
+            LCD_setup(msg, confirma);
+            
+            //permanece no estado 5 e zera a flag_tecla        
+            estado_tecla = 5;
+            flag_tecla = 0;        
+        }
+
+        //se flag_tecla for igual a 1 e tecla for igual a #
+        if((flag_tecla == 1) && (tecla == '#')){
+            //confere status da memória e verifica se o usuário digitou um valor coerente
+            //Se não, estado_tecla recebe 'b' e o dado_transferido é limpo        
+            status();
+            if((str_to_int(dado_transferido) >= 1022) || (str_to_int(dado_transferido) > dado_gravado) || (str_to_int(dado_transferido) == 0)){
+              estado_tecla = 'b';
+              tempo_escrita = 0;
+              dado_transferido = "";
+            }
+            //Se sim, estado_tecla recebe 't'
+            else{
+              estado_tecla = 't';
+              tempo_escrita = 0;
+            }
+            
+        }
+        //se flag_tecla for igual a 1 e tecla for igual a *
+        //o comando foi cancelado e estado_tecla recebe 'b'
+        if((flag_tecla == 1) && (tecla == '*')){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+            dado_transferido = "";                  //dado_transferido é limpo
+            flag_transf = 1;                        //sinaliza para indicar a correta mensagem a ser mostrada do display
+        }
+      break;
+
+    //estado 6 --> confirmação ou cancelamento do comando
+    case 'c':
+
+      //Se tecla pressionada anteriormente for 1   
+      if(opcao == '1'){
+
+          //se flag_tecla for zero (nenhuma tecla apertada) estado_tecla recebe 'c' (fica no estado atual)
+          if(flag_tecla == 0){
+            estado_tecla = 'c';
+          }
+          //se flag_tecla for 1 e tecla for # (comando confirmado)
+          //estado_tecla recebe 1 e flag_tecla é zerada (espera outra tecla ser pressionada)
+          if((flag_tecla == 1) && (tecla == '#')){
+            estado_tecla = 1;
+            flag_tecla = 0;
+            tempo_escrita = 0;
+          }
+          //se flag_tecla for 1 e tecla for * (comando cancelado)
+          //estado_tecla recebe 'b' (estado de cancelamento de comando)
+          if(flag_tecla == 1 and tecla == '*'){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+          }        
+      }
+
+      //Se tecla pressionada anteriormente for 2 
+      if(opcao == '2'){
+          //se flag_tecla for zero (nenhuma tecla apertada) estado_tecla recebe 'c' (fica no estado atual)
+          if(flag_tecla == 0){
+            estado_tecla = 'c';
+          }
+          //se flag_tecla for 1 e tecla for # (comando confirmado)
+          //estado_tecla recebe 2 e flag_tecla é zerada (espera outra tecla ser pressionada)
+          if((flag_tecla == 1) && (tecla == '#')){
+            estado_tecla = 2;
+            flag_tecla = 0;            
+          }
+          //se flag_tecla for 1 e tecla for * (comando cancelado)
+          //estado_tecla recebe 'b' (estado de cancelamento de comando)
+          if(flag_tecla == 1 and tecla == '*'){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+          }        
+      }
+
+      //Se tecla pressionada anteriormente for 3 
+      if(opcao == '3'){
+
+          //se flag_tecla for zero (nenhuma tecla apertada) estado_tecla recebe 'c' (fica no estado atual)
+          if(flag_tecla == 0){
+            estado_tecla = 'c';
+          }
+          //se flag_tecla for 1 e tecla for # (comando confirmado)
+          //estado_tecla recebe 3 e flag_tecla é zerada (espera outra tecla ser pressionada)
+          if((flag_tecla == 1) && (tecla == '#')){
+            estado_tecla = 3;
+            flag_tecla = 0;
+          }
+          //se flag_tecla for 1 e tecla for * (comando cancelado)
+          //estado_tecla recebe 'b' (estado de cancelamento de comando)
+          if(flag_tecla == 1 and tecla == '*'){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+          }        
+      }
+
+      //Se tecla pressionada anteriormente for 4       
+      if(opcao == '4'){
+          //se flag_tecla for zero (nenhuma tecla apertada) estado_tecla recebe 'c' (fica no estado atual)
+          if(flag_tecla == 0){
+            estado_tecla = 'c';
+          }
+          //se flag_tecla for 1 e tecla for # (comando confirmado)
+          //estado_tecla recebe 4 e flag_tecla é zerada (espera outra tecla ser pressionada)
+          if((flag_tecla == 1) && (tecla == '#')){
+            estado_tecla = 4;
+            flag_tecla = 0;
+            tempo_escrita = 0;
+          }
+          //se flag_tecla for 1 e tecla for * (comando cancelado)
+          //estado_tecla recebe 'b' (estado de cancelamento de comando)
+          if(flag_tecla == 1 and tecla == '*'){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+          }        
+      }
+
+      //Se tecla pressionada anteriormente for 5    
+      if(opcao == '5'){
+          //se flag_tecla for zero (nenhuma tecla apertada) estado_tecla recebe 'c' (fica no estado atual)
+          if(flag_tecla == 0){
+            estado_tecla = 'c';
+          }
+          //se flag_tecla for 1 e tecla for # (comando confirmado)
+          //estado_tecla recebe 5 e flag_tecla é zerada (espera outra tecla ser pressionada). Além disso, printa mensagem pedindo para o usuario
+          //informar quantidade de dados a serem transferidos
+          if((flag_tecla == 1) && (tecla == '#')){
+            msg = "Qtd. de 1 a 1023";
+            confirma = "                ";      
+            LCD_setup(msg, confirma);
+
+            estado_tecla = 5;
+            flag_tecla = 0;
+          }
+          //se flag_tecla for 1 e tecla for * (comando cancelado)
+          //estado_tecla recebe 'b' (estado de cancelamento de comando)
+          if(flag_tecla == 1 and tecla == '*'){
+            estado_tecla = 'b';
+            tempo_escrita = 0;
+            flag_transf = 1;                          //sinaliza para indicar a correta mensagem a ser mostrada do display
+          }        
+      }
+      break;
+
+    //estado 7 --> cancelamento de comando    
+    case 'b':
+
+      //enquanto o tempo_escrita for menor que 2s (1250) printa uma mensagem no display LCD mostrando que o comando dado anteriormente foi cancelado
+      //e continua no estado 'b'
+      //aqui essa mensagem também será printada uma única vez, embora permaneça no display LCD 
+      //No entanto, o caso 5, pode ter dois tipos de mensagem: se o valor digitado estiver incoerente o comando também será cancelado, mas com
+      //uma mensagem de erro indicando que a quantidade está incorreta. Mas se o comando foi somente cancelado (apertou-se o *) a mensagem de "Cmd Cancelado!"
+      //irá aparecer (a última mensagem aparece para os outros casos)
+       if(tempo_escrita < 1250){
+            if(funcao == 0){
+                if((opcao == '5') && (flag_transf == 0)){
+                    msg = "Qtd. errada!    ";
+                    confirma = "                ";      
+                    LCD_setup(msg, confirma);
+                    funcao = 1;                
+                }
+                else{
+                    msg = "Cmd Cancelado!  ";
+                    confirma = "                ";      
+                    LCD_setup(msg, confirma);
+                    funcao = 1; 
+                    flag_transf = 0;               
+                }             
+            }
+            estado_tecla = 'b';           
+        }
+        //após os 2s as variáveis estado_tecla, boas_vindas e funcao são resetadas
+        else{
+            estado_tecla = 0;
+            flag_tecla = 0;
+            boas_vindas = 0;
+            funcao = 0;
+        }
+        break;
+
+    //estado 8 --> Mensagem de tranferencia de dados
+    case 't':
+      //enquanto o tempo_escrita for menor que 2s (1250) printa uma mensagem no display LCD mostrando que a tranferencia de dados está em progresso
+      //e continua no estado 't'
+      //aqui essa mensagem também será printada uma única vez, embora permaneça no display LCD
+      if(tempo_escrita < 1250){
+            if(funcao == 0){
+
+              msg = "Transferindo... ";
+              confirma = "                ";      
+              LCD_setup(msg, confirma);
+              funcao = 1;
+            }
+            estado_tecla = 't';
+            
+        }
+        //após os 2s a variável caso recebe 5 e as variáveis estado_tecla, boas_vindas e funcao são resetadas
+        else{
+            caso = 5;
+            funcao = 0;
+            estado_tecla = 0;
+            boas_vindas = 0;
+            flag_tecla = 0;
+        }
+        break;
+  }
+
+  //Parte do loop principal que irá responder aos valores enviados pela máquina de estados
+
+  //Mede temperatura e exibe ao mesmo tempo o valor no display de sete segmentos  
+  temperatura = mede_temperatura();
+  mostra_temperatura();
+
+  //execução de comando de acordo com o caso retornado pela máquina de estados
+  //Se caso for igual a 1 a memória é resetada e caso recebe zero para entrar nesse if apenas uma vez
+  if(caso == 1){
+      reseta_memoria();
+      caso = 0;
+  }
+
+  //Se caso for igual a 2 confere o status da memória (dado gravado e dado disponível) e exibe os valores no display LCD
+  //caso recebe zero para entrar nesse if apenas uma vez
+  if(caso == 2){  
+      status();
+      LCD_setup("Dado Salvo: " + String(dado_gravado), "Dado Livre: " + String(dado_disponivel));
+      caso = 0;          
+  }
+
+  //Se caso for igual a 3 chama a função para coletar os dados de temperatura e armazenar na memória
+  //Note, que aqui caso não recebe zero para que a coleta só se encerre se o caso 4 for acionado
+  if(caso == 3){  
+      coleta_dados(temperatura);
+  }
+
+  //Se caso for igual a 4 encerra-se a coleta de dados e caso recebe zero para entrar nesse if apenas uma vez.
+  //além disso, a variável flag recebe 0 para habilitar novamente as outras funções após o estado anterior ser o 3 (coleta de dados)
+  if(caso == 4){
+    caso = 0; 
+    flag = 0;
+  }
+
+  //Se caso for igual a 5 chama a função para transferir dados e caso recebe zero para entrar nesse if apenas uma vez
+  if(caso == 5){
+      transfere_dados();
+      caso = 0;  
+  }
+}
+
