@@ -1,0 +1,205 @@
+/*#######################################################
+#							#
+#   Módulo II - Estimativa da frequência de rotação do  #
+#       eixo de um motor a partir de encoder óptico     #
+#							#
+#	Mariane Martins 	       - RA:221919	#
+#	Wesna Simone Bulla de Araujo   - RA:225843	#
+#							#
+#########################################################
+*/
+
+/*
+Esse programa tem por objetivo estimar a frequência de rotação
+do motor DC através de um encoder óptico. Essa estimativa é
+mostrada através do monitor serial a cada 0.8s. Para isso,
+foram desenvolvidas duas rotinas de interrupção: uma baseada
+na interrupção por timer, para contar o tempo de estimação da
+frequência, e a outra baseada em interrupção externa que ocorre 
+a cada mudança de borda coletada do pino do encoder. Essa última
+interrupção é utilizada para auxiliar no calculo da frequência de 
+rotação, que é dada por
+
+f = Np/(N*T) [Hz], onde
+
+Np --> é o número de pulsos gerados pelo encoder dentro de um intervalo
+de tempo T;
+T --> é o período que se deseja estimar a frequência;
+N --> é o número de pulsos que o encoder gera em uma volta.
+
+Note que T é definido pela interrupção de timer e Np pela interrupção
+externa. N já é um valor conhecido, e no caso para o motor usado vale 2.
+*/
+
+//Declaração de variáveis e definição de pinos
+#define encoder 2                               //Define o pino de saída do encoder óptico. Note que o pino 2 foi escolhido, pois está associado a interrupção externa INT0
+#define velocidade 3 				//Define o pino PWM que irá controlar a velocidade do motor (ligado ao enable1,2 do L293D)  
+#define E1 4    				//Define a entrada 1 da ponte H 
+#define E2 7    				//Define a entrada 2 da ponte H
+
+volatile int tempo = 0;                         //Define variável contador de tempo que também será utilizada dentro da interrupção. Inicializa variável em zero.
+volatile int Np = 0;                            //Define variável contador de borda que também será utilizada dentro da interrupção. Inicializa variável em zero.
+int N = 2;                                      //Define variável quantidade de pulsos por volta do encoder.
+int prescaler = 1024;                           //Define prescaler (fator de redução para modificar uma frequência) para o calulo do TIMER
+float clock = 16*pow(10,6);                     //Define valor do clock do relógio para o calculo do TIMER
+int faixa = 25;                                 //Define faixa de valores de contagem do temporizador para o calculo do TIMER
+float interrupt;                                //Variável que irá armazenar o valor do tempo em que a interrupção do TIMER irá acontecer
+float T;                                        //Variável que será utilizada para armazenar o valor do período de acordo com a contagem do TIMER
+float f;                                        //Variável que irá armazenar o valor da frequência de rotação
+char dir;					//Define variável relacionada ao sentido de rotação do motor
+int duty = 0;					//Inicializa variável relacionada a porcentagem de duty cycle em zero.
+float tensao = 0;				//Inicializa variável relacionada a tensão/velocidade do motor em zero.
+
+
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup() {
+
+    Serial.begin(9600);                         //Configura a taxa de transferência de bits para a comunicação serial. Ex:9600 bits por segundo
+
+    pinMode(encoder, INPUT);                    //Declara pino encoder como entrada já que será extraido informações desse pino (bordas do sinal)
+    pinMode(velocidade, OUTPUT);		//Declara pino PWM como saída, pois ele irá receber os novos valores de tensão calculados através do duty cycle.
+    pinMode(E1, OUTPUT);			//Declara entrada 1 da ponte H como saída, pois ela irá receber nível lógico zero ou 1 
+    pinMode(E2, OUTPUT);			//Declara entrada 2 da ponte H como saída, pois ela irá receber nível lógico zero ou 1, que combinada
+                                                //com a configuração de E1 irá decidir o sentido de rotação do motor.
+
+    cli();                                      //Desabilita as interrupções
+    configuracao_Timer0();                      //Configura o temporizador
+    EIMSK = 0x01;                               //Habilita a interrupção externa INT0
+    EICRA = 0x01;                               //Configura a interrupção INT0 para acontecer a cada mudança de borda (subida e descida).
+                                                //Essa configuração foi escolhida levando em consideração a precisão da estimativa da frequência dada por 0.34 RPM/contagem.
+						//(resolução = 1/(2*Np*T))  
+    sei();                                      //Habilita as interrupções
+ 
+    interrupt = (prescaler/clock)*faixa;        //Calcula tempo em que a rotina de interrupção por TIMER irá ocorrer (a cada 1.6ms)
+}
+
+//Modulo I --> Acionamento do motor
+//##################################################################################################################
+//Modularização das rotinas que controlam o sentido de rotação do motor
+
+//1- Função responsável por controlar o giro do motor no sentido anti-horário
+void giro_antihorario(){
+    digitalWrite(E1,LOW);			//Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,HIGH);			//Atribui a entrada 2 da ponte H o nível lógico 1
+}
+
+//2- Função responsável por controlar o giro do motor no sentido horário
+void giro_horario(){
+    digitalWrite(E1,HIGH);			//Atribui a entrada 1 da ponte H o nível lógico 1
+    digitalWrite(E2,LOW);  			//Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+//3- Função responsável por parar o motor
+void para_motor(){
+    digitalWrite(E1,LOW);			//Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,LOW);			//Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+//4- Função que modifica o sentido do giro e o valor da velocidade do motor ao receber como parâmetros
+//dir: direção do giro
+//duty: porcentagem do duty cycle
+void motor(char dir, int duty){
+ 
+  tensao = (duty*255.0)/100.0;			//Variável recebe o valor de tensão associado ao duty cycle escolhido.
+  						//Basicamente essa equação calcula a largura que o sinal PWM terá em nível alto
+  						//levando em consideração a porcentagem (duty cycle) em relação ao nível alto (255V).
+ 
+  analogWrite(velocidade, (int) tensao);	//Escreve o novo valor de tensão calculado no pino PWM. Note que a conversão para um valor
+  						//inteiro foi dada só depois do término da conta para evitar aproximações erradas.
+ 
+  //De acordo com o caracter dir o motor gira para um sentido
+  switch (dir){
+    
+    //Se dir = 'r' chama a função girar no sentido horário e depois sai da função retornando imediatamente para o código principal
+    case 'r': 
+      	giro_horario();
+      	break;
+    
+   //Se dir = 'l' chama a função girar no sentido anti-horário e depois sai da função retornando imediatamente para o código principal
+    case 'l':
+      	giro_antihorario();
+      	break;
+   
+    //Se dir = 's' chama a função para parar o motor e depois sai da função retornando imediatamente para o código principal
+    case 's': 
+      	para_motor();
+      	break;
+   
+    //Se nenhum dos caracteres anteriores for usado não faz nada e volta para o código principal
+    default:
+      	break;  
+  }     
+}
+//####################################################################################################################
+
+//Função responsável pela configuração da interrupção por TIMER
+void configuracao_Timer0(){
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Configuracao Temporizador 0 (8 bits) para gerar interrupcoes periodicas a cada 1.6ms no modo Clear Timer on Compare Match (CTC)
+  // Relogio = 16e6 Hz
+  // Prescaler = 1024
+  // Faixa = 25 (contagem de 0 a OCR0A = 24)
+  // Intervalo entre interrupcoes: (Prescaler/Relogio)*Faixa = (1024/16e6)*(24+1) = 1.6ms
+ 
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 24;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+ 
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    1
+  TCCR0B = 0x05;
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+
+// Rotina de interrupção por TIMER:
+//A cada 1.6ms o programa principal é desviado para essa rotina que incrementa o contador tempo
+//Basicamente ao multiplicar o valor desse contador com o tempo de interrupção (1.6ms) tem-se o valor do período T.
+ISR(TIMER0_COMPA_vect){
+  tempo++;                                  //Incrementa contador de tempo
+}
+
+// Rotina de interrupção por mudança de borda:
+// Toda vez que na saída do encoder (pino 2) for detectado uma mudança de borda (nível alto para baixo e vice versa) o programa principal é
+// desviado para essa rotina que incrementa Np. Isso irá ocorrer até o tempo definido para T (arbitrário) e irá representar a quantidade de bordas durante o
+// intervalo T. Além disso, foi escolhido a rotina de interrupção ao invés de varredura, pois além de ser mais simples e já possuir uma estrutura bem
+//definida no arduino, é mais garantido que ocorra uma contagem mais precisa de bordas visto que ao detectar uma mudança o programa principal é imediatamente
+// interrompido para atender a interrupção independente da ação que estava sendo executada antes da mudança de borda.
+ISR(INT0_vect) {
+  Np++;                                     //Incrementa contador de borda
+}
+
+
+//Código principal
+void loop() {
+
+  motor('r',50);                            //Chama função que faz o motor girar no sentido horário com duty cycle de 50% 
+                                            //Motor gira o tempo todo para o mesmo sentido, apenas para testar o funcionamento do encoder e estimativa da frequência.
+  
+  //Calcula a frequência de rotação e printa o resultado no serial monitor
+  if (tempo >= 500){                        //Se a contagem de tempo for maior ou igual a 500, isto é, passaram-se 0.8s
+    T = interrupt*tempo;                    //Calcula-se o tempo T correspondente (0.8s) e
+    f =(Np/(2*N*T))*60;                     //a estimativa da frequencia em rpm, por isso a multiplicação por 60. Além disso, como a contagem da interrupção
+                                            //por mudança de borda ocorre tanto para borda de subida, quanto de descida é necessário dividir o valor de Np por dois
+                                            //para de fato computar cada pulso uma única vez.
+    
+    //Printa no monitor serial o valor da estimativa
+    Serial.print(f);			    //para esse valor de duty cycle o valor da velocidade printado foi de 2062.5 RPM com algumas variações nos resultados
+    Serial.println(" RPM");		    //provavelmente devido a cortes de uma interrupção em relação a outra.
+
+    //As variáveis globais que também são utiizadas na interrupção são zeradas para reiniciar a contagem
+    tempo = 0;
+    Np = 0;
+  }
+}
+
