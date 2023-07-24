@@ -1,0 +1,51 @@
+/*#######################################################
+#							#
+#           Módulo V -  Expansor de portas I2C          #
+#                                                       #
+#	  Mariane Martins 	         - RA:221919    #
+#	  Wesna Simone Bulla de Araujo   - RA:225843    #
+#	        	                                #
+#							#
+#########################################################
+*/
+
+/*Esse programa tem por objetivo acender o segmento "a"
+de dois dos quatro displays de 7 segmentos através do uso
+do protocolo de comunicação I2C.
+
+O led é aceso conforme uma variável vai sendo incrementada. 
+*/
+
+
+//Declara biblioteca de comunicação I2C
+#include <Wire.h>
+
+
+//Declaração de variáveis e definição de pinos
+#define led 13                                  //Define pino 13 como led interno para a verificação da transmissão I2C
+unsigned char val = 0;                          //Define variável para incrementar seu valor ao longo do loop principal
+
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup() {
+  Wire.begin();                                 //Inicializa o barramento I2C
+  pinMode(led, OUTPUT);                         //Declara led como pino de saída
+  digitalWrite(led,LOW);                        //Inicia led apagado
+}
+
+//Programa principal
+void loop() {
+
+    digitalWrite(led,HIGH);                    //Acende led para sinalizar inicio de transmissão I2C
+    Wire.beginTransmission(32);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+                                               //Nesse caso foi utilizado o valor 32, pois corresponde a configuração das entradas A2=0 A1=0 A0=0 da interface I2C
+                                               //conforme o datasheet do CI PCF8574. Além disso, inicializa a transmissão (bit de início)
+
+    Wire.write(val);                           //Envia de fato o dado desejado
+    Wire.endTransmission();                    //Finaliza a transmissão com o envio do bit de parada
+    digitalWrite(led,LOW);                     //Apaga led para sinalizar fim de transmissão I2C
+
+    _delay_ms(100);                            //Espera 100 ms para iniciar uma nova transmissão
+
+    val++;                                     //Incrementa variável para modificar o padrão de acender os leds
+}
