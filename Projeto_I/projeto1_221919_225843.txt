@@ -1,0 +1,554 @@
+/*#######################################################
+#                                                       #
+#     Projeto I - Controlador de Ventilador de Teto     #
+#                                                       #
+#     Mariane Martins                - RA:221919        #
+#     Wesna Simone Bulla de Araujo   - RA:225843        #
+#                                                       #
+#                                                       #
+#########################################################
+*/
+
+/*
+Esse projeto teve por objetivo desenvolver um controlador
+de ventilador de teto, explorando conceitos de transmissão
+serial, protocolo I2C, display LCD, display de sete segmentos,
+encoder óptico + schmitt trigger, ponte H (L293D), 
+expansor de portas (PCF8574), decodificador de display 
+de sete segmentos (CD4511B) e módulo bluetooth. 
+Assim, a função do programa é controlar o motor DC através
+de comandos enviados via bluetooth (mas também pode ser
+enviado via serial) e exibir o estado do motor (VENTILACAO, 
+EXAUSTOR, PARADO e o valor do duty cycle atual) em um display 16x2. 
+Além disso, através do acionamento de um display de sete segmentos 
+é informado a todo momento o valor da velocidade atual. 
+Os seguintes comandos estão disponíveis no código:
+
+- VEL _ _ _* --> controla a velocidade do motor. É necessário
+passar um valor entre 0 - 100. Note que é necessário digitar
+3 digitos;
+- VENT* --> define o sentido de rotação para girar no modo
+ventilador;
+- EXAUST* --> define o sentido de rotação para girar no modo
+exaustor;
+- PARA* --> para o motor;
+- RETVEL* --> mostra a velocidade estimada atual do motor;
+
+Observe que todos os comandos devem ser finalizados em * para que
+o programa responda corretamente. Além disso, as mensagens de
+confirmação do envio do comando são mostradas na interface do app
+'Serial Bluetooth Terminal' ou no próprio Serial Monitor, no caso da
+utilização de comunicação via serial.
+
+*/
+
+
+//Importa bibliotecas
+#include <LiquidCrystal.h>                     //Importa biblioteca para controlar o display 16x2
+#include <Wire.h>                              //Declara biblioteca de comunicação I2C
+
+
+//Declaração de variáveis e definição de pinos
+#define encoder 2                               //Define o pino de saída do encoder óptico. Note que o pino 2 foi escolhido, pois está associado a interrupção externa INT0
+#define velocidade 3                            //Define o pino PWM que irá controlar a velocidade do motor (ligado ao enable1,2 do L293D)  
+#define E1 4                                    //Define a entrada 1 da ponte H
+#define E2 7                                    //Define a entrada 2 da ponte H
+
+#define rs 6                                    //Define o pino responsável por selecionar a natureza do dado, isto é, comando ou configuração
+#define e 8                                     //Define pino reponsável por habilitar operações
+#define rw 9                                    //Define pino responsável pela leitura ou escrita. Se leitura o pino recebe 1, se escrita o pino recebe 0
+#define d4 10                                   //Define pino de dados. Note que foi escolhida a configuração de apenas 4 bits ao invés de 8 bits disponíveis no display
+#define d5 11                                   //
+#define d6 12                                   //
+#define d7 5                                    //
+
+
+volatile int tempo = 0;                         //Define variável contador de tempo que também será utilizada dentro da interrupção. Inicializa variável em zero.
+volatile int Np = 0;                            //Define variável contador de borda que também será utilizada dentro da interrupção. Inicializa variável em zero.
+int N = 2;                                      //Define variável quantidade de pulsos por volta do encoder.
+int prescaler = 1024;                           //Define prescaler (fator de redução para modificar uma frequência) para o calulo do TIMER
+float clock = 16*pow(10,6);                     //Define valor do clock do relógio para o calculo do TIMER
+int faixa = 25;                                 //Define faixa de valores de contagem do temporizador para o calculo do TIMER
+float interrupt;                                //Variável que irá armazenar o valor do tempo em que a interrupção do TIMER irá acontecer
+float T;                                        //Variável que será utilizada para armazenar o valor do período de acordo com a contagem do TIMER
+float f = 0;                                    //Variável que irá armazenar o valor da frequência de rotação. Default: 0;
+char dir = 's';                                 //Define variável relacionada ao sentido de rotação do motor. Dafault: 's' --> motor parado
+int duty = 0;                                   //Inicializa variável relacionada a porcentagem de duty cycle em zero.
+float tensao = 0;                               //Inicializa variável relacionada a tensão/velocidade do motor em zero.
+
+String comando;                                 //Variável que será utilizada para armazenar a concatenação dos caracteres recebidos pela serial
+String parametro_vel;                           //Variável que será utilizada para receber o parâmetro de velocidade
+int vel;                                        //Variável que irá armazenar o valor do duty cycle para ser usada ao longo do programa
+int state_parado = 0;                           //Flag que sinaliza que se o motor está parado ou não. Default: 0 --> parado
+int recebido = 0;                               //Flag que sinaliza se o buffer pode ser apagado ou não e se existe algum comando a ser executado
+
+
+//Inicializa o objeto LiquidCrystal com as informações de pinos
+LiquidCrystal lcd(rs, rw, e, d4, d5, d6, d7);    
+String display = "PARADO";                      //Define variável que irá armazenar a mensagem a ser mostrada do display. Default: "PARADO".
+
+
+//Configura display de 7 segmentos e armazena em um vetor --> qual display será aceso?
+unsigned int display1 = 0b01110000;
+unsigned int display2 = 0b10110000;
+unsigned int display3 = 0b11010000;
+unsigned int display4 = 0b11100000;
+unsigned int display_seg[] = {display1, display2, display3, display4};
+
+int displays = 0;                               //Define variável que irá receber o código para acionar o display
+int count = 0;                                  //Define variavel para auxiliar no print do display
+String D = "0";                                 //Define variável do tipo string para separar os digitos recebidos pela frequência
+int val[4] = {0, 0, 0, 0};                      //Define variável que irá armazenar a combinação do display e do digito a ser printado
+volatile int periodo = 0;                       //Define variável para auxiliar na temporização do tempo de ativação dos displays
+int c = 0;                                      //Define váriavel auxíliar;
+
+
+//Modulo IV --> Display LCD 16x2
+//##################################################################################################################
+
+//Função responsável por exibir no display o estado do motor.
+//display: Mensagem a ser exibida no display
+//vel: valor do duty cycle a ser exibido no display
+void LCD_setup (String display, int vel){
+  lcd.clear();                                 //Limpa o display
+  lcd.setCursor(0, 0);                         //Configura a coluna e a linha, repectivamente, onde a mensagem irá iniciar. Nesse caso, a mensagem irá aparecer na primeira linha do display
+  lcd.print(display);                          //Printa a mensagem do estado o motor
+  lcd.setCursor(0, 1);                         //Configura a coluna e a linha, repectivamente, onde a mensagem irá iniciar. Nesse caso, a mensagem irá aparecer na segunda linha do display
+  lcd.print("DC: ");                           //Printa a mensagem sobre o valor do duty cycle
+  lcd.print(vel);                              //
+  lcd.print("%");                              //
+ }
+
+//##################################################################################################################
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup() {
+
+    Serial.begin(9600);                         //Configura a taxa de transferência de bits para a comunicação serial. Ex:9600 bits por segundo
+
+    pinMode(encoder, INPUT);                    //Declara pino encoder como entrada já que será extraido informações desse pino (bordas do sinal)
+    pinMode(velocidade, OUTPUT);                //Declara pino PWM como saída, pois ele irá receber os novos valores de tensão calculados através do duty cycle.
+    pinMode(E1, OUTPUT);                        //Declara entrada 1 da ponte H como saída, pois ela irá receber nível lógico zero ou 1
+    pinMode(E2, OUTPUT);                        //Declara entrada 2 da ponte H como saída, pois ela irá receber nível lógico zero ou 1, que combinada
+                                                //com a configuração de E1 irá decidir o sentido de rotação do motor.
+    cli();                                      //Desabilita as interrupções
+    configuracao_Timer0();                      //Configura o temporizador
+    EIMSK = 0x01;                               //Habilita a interrupção externa INT0
+    EICRA = 0x01;                               //Configura a interrupção INT0 para acontecer a cada mudança de borda (subida e descida).
+                                                //Essa configuração foi escolhida levando em consideração a precisão da estimativa da frequência dada por 0.34 RPM/contagem.
+            					//(resolução = 1/(2*Np*T))  
+    sei();                                      //Habilita as interrupções
+ 
+    interrupt = (prescaler/clock)*faixa;        //Calcula tempo em que a rotina de interrupção por TIMER irá ocorrer (a cada 1.6ms)
+
+
+    lcd.begin(16, 2);                           //Define o número de colunas e linhas a ser utilizada no display
+    LCD_setup (display, vel);                   //Chama a função LCD_setup para iniciar o display com o modo parado do motor
+    Wire.begin();                               //Inicializa o barramento I2C
+}
+
+
+//Modulo I --> Acionamento do motor
+//##################################################################################################################
+
+//Modularização das rotinas que controlam o sentido de rotação do motor
+
+//1- Função responsável por controlar o giro do motor no sentido anti-horário
+    void giro_antihorario(){
+    digitalWrite(E1,LOW);       //Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,HIGH);      //Atribui a entrada 2 da ponte H o nível lógico 1
+}
+
+//2- Função responsável por controlar o giro do motor no sentido horário
+    void giro_horario(){
+    digitalWrite(E1,HIGH);      //Atribui a entrada 1 da ponte H o nível lógico 1
+    digitalWrite(E2,LOW);       //Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+
+//3- Função responsável por parar o motor
+    void para_motor(){
+    digitalWrite(E1,LOW);     //Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,LOW);     //Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+
+//4- Função que modifica o sentido do giro e o valor da velocidade do motor ao receber como parâmetros
+//dir: direção do giro
+//duty: porcentagem do duty cycle
+void motor(char dir, int duty){
+ 
+  tensao = (duty*255.0)/100.0;            //Variável recebe o valor de tensão associado ao duty cycle escolhido.
+                                          //Basicamente essa equação calcula a largura que o sinal PWM terá em nível alto
+                                          //levando em consideração a porcentagem (duty cycle) em relação ao nível alto (255V).
+ 
+  analogWrite(velocidade, (int) tensao);  //Escreve o novo valor de tensão calculado no pino PWM. Note que a conversão para um valor
+                                          //inteiro foi dada só depois do término da conta para evitar aproximações erradas.
+ 
+  //De acordo com o caracter dir o motor gira para um sentido
+  switch (dir){
+   
+    //Se dir = 'r' chama a função girar no sentido horário e depois sai da função retornando imediatamente para o código que a chamou
+    case 'r':
+        giro_horario();
+        break;
+   
+   //Se dir = 'l' chama a função girar no sentido anti-horário e depois sai da função retornando imediatamente para o código que a chamou
+    case 'l':
+        giro_antihorario();
+        break;
+   
+    //Se dir = 's' chama a função para parar o motor e depois sai da função retornando imediatamente para o código que a chamou
+    case 's':
+        para_motor();
+        break;
+   
+    //Se nenhum dos caracteres anteriores for usado não faz nada e volta para o código que a chamou
+    default:
+        break;  
+  }    
+}
+//####################################################################################################################
+
+
+//Modulo II --> Estimativa da velocidade do motor
+//####################################################################################################################
+
+//Função responsável pela configuração da interrupção por TIMER
+void configuracao_Timer0(){
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Configuracao Temporizador 0 (8 bits) para gerar interrupcoes periodicas a cada 1.6ms no modo Clear Timer on Compare Match (CTC)
+  // Relogio = 16e6 Hz
+  // Prescaler = 1024
+  // Faixa = 25 (contagem de 0 a OCR0A = 24)
+  // Intervalo entre interrupcoes: (Prescaler/Relogio)*Faixa = (1024/16e6)*(24+1) = 1.6ms
+ 
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 24;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+ 
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    1
+  TCCR0B = 0x05;
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+
+// Rotina de interrupção por TIMER:
+//A cada 1.6ms o programa principal é desviado para essa rotina que incrementa o contador tempo
+//Basicamente ao multiplicar o valor desse contador com o tempo de interrupção (1.6ms) tem-se o valor do período T.
+ISR(TIMER0_COMPA_vect){
+  tempo++;                                  //Incrementa contador de tempo relacionado ao calculo da frequência de rotação
+  periodo++;                                //Incrementa contador de tempo relacionado ao calculo de tempo de ativação dos displays de sete segmentos
+
+  //Para garantir que os displays sempre fiquem acesos a variável periodo é zerada assim que atinge o valor 4, visto que há 4 displays (0, 1, 2, 3)
+  //e que estamos considerando um intervalo de ativação de 1,6ms (mesmo valor da interrupção por temporizador)
+  if(periodo == 4){
+    periodo = 0;    
+  }
+}
+
+
+// Rotina de interrupção por mudança de borda:
+// Toda vez que na saída do encoder (pino 2) for detectado uma mudança de borda (nível alto para baixo e vice versa) o programa principal é
+// desviado para essa rotina que incrementa Np. Isso irá ocorrer até o tempo definido para T (arbitrário) e irá representar a quantidade de bordas durante o
+// intervalo T. Além disso, foi escolhido a rotina de interrupção ao invés de varredura, pois além de ser mais simples e já possuir uma estrutura bem
+//definida no arduino, é mais garantido que ocorra uma contagem mais precisa de bordas visto que ao detectar uma mudança o programa principal é imediatamente
+// interrompido para atender a interrupção independente da ação que estava sendo executada antes da mudança de borda.
+ISR(INT0_vect) {
+  Np++;                                     //Incrementa contador de borda
+}
+
+
+// Função que calcula a estimativa da velocidade de giro do motor
+float rpm() {
+  //Calcula a frequência de rotação e printa o resultado no serial monitor
+  if (tempo >= 500){                                          //Se a contagem de tempo for maior ou igual a 500, isto é, passaram-se 0.8s
+    T = interrupt*tempo;                                      //Calcula-se o tempo T correspondente (0.8s) e
+    f =(Np/(2*N*T))*60;                                       //a estimativa da frequencia em rpm, por isso a multiplicação por 60. Além disso, como a contagem da interrupção                                    
+                                                              //por mudança de borda ocorre tanto para borda de subida, quanto de descida é necessário dividir o valor de Np por dois
+                                                              //para de fato computar cada pulso uma única vez.
+
+    //Atualização do valor do display a cada 0.8s (mesmo intervalo de tempo em que a frequência é recalculada)    
+    D = String(int(f));                                         //Converte f em inteiro e depois converte em string para separar os digitos 
+    count = D.length() - 1;                                     //calcula o comprimento da string e subtrai um para definir o valor da última posição do vetor D
+    
+    //Para garantir que os digitos separados sejam corretamente posicionados em determinados displays
+    //combina-se o par display e digito D de modo que o último display sempre será combinado com o último elemento do vetor D,
+    //o penultimo display com o penultimo elemento e assim por diante. Isso garante que valores de frequência com menos de 4 digitos também sejam
+    //corretamente posicionados. Basicamente seria como printar no display de trás para frente.
+    for(c=3;c >= 0;c--){                                        //c = 3 pois considera a quantidade de indices dos displays disponíveis (0, 1, 2, 3)                 
+      val[c] = sete_segmento(display_seg[c], D[count]);         //chama a função que irá combinar display com digito
+      count--;                                                  //decrementa para passar para o próximo elemento de trás para frente
+    }
+
+    //As variáveis globais que também são utiizadas na interrupção são zeradas para reiniciar a contagem
+    tempo = 0;
+    Np = 0;
+
+  }
+   return f;                                                     //retorna a frequência estimada
+}
+//####################################################################################################################
+
+
+//Modulo III --> Recepção e decodificação de comandos
+//##################################################################################################################
+
+//Função que recebe os caracteres e concatena em uma string e sinaliza quando o comando termina em *
+int recebe(){
+  int flag = 0;                             //flag de sinalização de comando completo. Default: 0 para o caso da string não terminar em *
+  if (Serial.available() > 0) {             //se tiver conteúdo no buffer
+    comando += (char) Serial.read();        //lê o caracter e concatena com o anterior
+    if (comando.endsWith("*")){             //verifica se o último caracter da concatenação termina em *
+      flag = 1;                             //se sim retorna a flag de sinalização em 1 indicando comando pronto para executar
+    }
+  }  
+  return flag;                              //retorna a flag
+}
+
+
+//Modularização das execuções relacionados aos comandos
+//1 - modo ventilador
+int ventilador(float f){                     //recebe como parâmetro o valor da frequência
+  display = "VENTILACAO";                    //Atribui a variável display a mensagem "VENTILACAO"
+  if (dir != 'r' and f >= 0){                //se dir for diferente de 'r' e a frequência de rotação for maior ou igual a zero
+      motor('s', 0);                         //chama a função que para o motor
+        if(f == 0){                          //verifica se a velocidade do motor é zero (motor parado)
+          dir = 'r';                         //se sim, atribui a variavel dir 'r' e chama a função para rodar o motor para a direita.
+          motor(dir, vel);                   //note que foi passado um valor para a variável dir para armazenar a ultima direção de rotação do motor
+          state_parado = 0;                  //sinaliza que o motor conseguiu parar e já setou a nova direção de movimento
+          Serial.println("OK VENT");         //printa que o modo ventilador está funcionando no serial monitor
+          LCD_setup (display, vel);          //Chama a função LCD_setup para mostrar que o motor está no estado ventilador
+        }
+        else{                                //caso o motor ainda não tenha parado sinaliza para o programa principal
+          state_parado = 1;                  //para que ele volte a executar essa rotina antes de zerar o buffer
+        }        
+   }
+   else{                                     //caso dir já seja 'r'
+     state_parado = 0;                       //sinaliza que o motor já está na nova direção
+     Serial.println("OK VENT");              //printa que o modo ventilador está funcionando
+     LCD_setup (display, vel);               //Chama a função LCD_setup para mostrar que o motor está no estado ventilador
+   }
+   return state_parado;                      //retorna o sinalizador
+}
+
+
+//2 - modo exaustor
+int exaustor(float f){                      //recebe como parâmetro o valor da frequência
+   display = "EXAUSTAO";                    //Atribui a variável display a mensagem "EXAUSTAO"
+   if (dir != 'l' and f >= 0){              //se dir for diferente de 'l' e a frequência de rotação for maior ou igual a zero
+      motor('s', 0);                        //chama a função que para o motor
+        if(f == 0){                         //verifica se a velocidade do motor é zero (motor parado)
+          dir = 'l';                        //se sim, atribui a variavel dir 'l' e chama a função para rodar o motor para a esquerda.
+          motor(dir, vel);                  //note que foi passado um valor para a variável dir para armazenar a ultima direção de rotação do motor
+          state_parado = 0;                 //sinaliza que o motor conseguiu parar e já setou a nova direção de movimento
+          Serial.println("OK EXAUST");      //printa que o modo ventilador está funcionando
+          LCD_setup (display, vel);         //Chama a função LCD_setup para mostrar que o motor está no estado exaustor
+        }
+        else{                               //caso o motor ainda não tenha parado sinaliza para o programa principal
+          state_parado = 1;                 //para que ele volte a executar essa rotina antes de zerar o buffer
+        }      
+   }
+   else{                                    //caso dir já seja 'l'
+     state_parado = 0;                      //sinaliza que o motor já está na nova direção
+     Serial.println("OK EXAUST");           //printa que o modo ventilador está funcionando
+     LCD_setup (display, vel);              //Chama a função LCD_setup para mostrar que o motor está no estado exaustor
+   }
+   return state_parado;                     //retorna o sinalizador
+}
+
+//3 - modo velocidade
+void velo(String comando){                          //recebe como parâmetro a string de comando
+
+    parametro_vel = comando.substring(4, 7);        //seleciona apenas os 3 digitos que informam a velocidade da string do comando
+
+    //se o valor da velocidade estiver entre 0 e 100, o tamanho for 3 e o último caracter for diferente de * a velocidade irá mudar
+    if (parametro_vel.toInt() >= 0 and parametro_vel.toInt() <= 100 and parametro_vel.length()== 3 and !parametro_vel.endsWith("*")){
+      vel = parametro_vel.toInt();                  //armazena o valor inteiro da string que contêm a informação do duty cycle
+      motor(dir, vel);                              //chama a função para alterar a velocidade
+      Serial.print("OK VEL ");                      //confirma a alteração de velocidade e printa o valor escolhido
+      Serial.print(vel);                            //
+      Serial.println("%");                          //
+      LCD_setup (display, vel);                     //Chama a função LCD_setup para atualizar o valor do duty cycle no display
+    }
+    //caso qualquer um dos critérios acima não seja atendido
+    else{
+        //se a informação da velocidade da string for menor que 3 ou iniciar com vazio indica parâmetro da velocidade está ausente
+        if(parametro_vel.length()<3 or parametro_vel.startsWith(" ")){
+          Serial.println("ERRO: PARAMETRO AUSENTE");      
+        }
+        //se não o parâmetro da velocidade está incorreto
+        else{      
+          Serial.println("ERRO: PARAMETRO INCORRETO");  
+        }    
+    }
+}
+
+
+//4 - modo zerar velocidade
+void zerar_velocidade(){
+    dir = 's';                                  //se sim, atribui a variavel dir 's' e chama a função para parar o motor.
+    display = "PARADO";                         //Atribui a variável display a mensagem "PARADO"
+    motor(dir, 0);                              //chama a função que para o motor
+    Serial.println("OK PARA");                  //printa que o motor parou
+    LCD_setup (display, vel);                   //Chama a função LCD_setup para mostrar que o motor está no estado parado
+}
+
+
+//5 - modo mostra velocidade
+void mostra_velocidade(float f){                //recebe como parâmetro o valor da frequência
+    Serial.print(f);                            //printa o valor da velocidade em rpm
+    Serial.println(" RPM");                     //
+}
+
+//##################################################################################################################
+
+
+//Modulo V --> Expansor de portas I2C
+//##################################################################################################################
+
+//Função responsável pela transmissão I2C para o display de 7 segmentos
+//val: valor a ser enviado pelo protocolo
+void transmissao(int val){
+    Wire.beginTransmission(32);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+                                               //Nesse caso foi utilizado o valor 32, pois corresponde a configuração das entradas A2=0 A1=0 A0=0 da interface I2C
+                                               //conforme o datasheet do CI PCF8574. Além disso, inicializa a transmissão (bit de início)
+
+    Wire.write(val);                           //Envia de fato o dado desejado
+    Wire.endTransmission();                    //Finaliza a transmissão com o envio do bit de parada
+}
+//##################################################################################################################
+
+
+//Modulo VI --> Acionamento de display via protocolo I2C
+//##################################################################################################################
+
+//Função responsável por converter um caracter em valor binário inteiro
+//e combinar (somar) com o correto display ao receber como parâmetros
+//display: codigo que identifica o correto display
+//D: digito a ser combinado com o código do display
+//A função retorna o valor a ser enviado pelo protocolo I2C
+int sete_segmento(int displays, char D){
+    if (D == '0' ){
+      D = 0b00000000;
+    }
+    else if (D == '1'){
+      D = 0b00000001;
+    }
+    else if (D == '2'){
+       D = 0b00000010;
+    }
+     else if (D == '3'){
+       D = 0b00000011;
+    }
+    else if (D == '4'){
+      D = 0b00000100;
+    }
+    else if (D == '5'){
+      D = 0b00000101;
+    }
+    else if (D == '6'){
+      D = 0b00000110;
+    }
+    else if (D == '7'){
+       D = 0b00000111;
+    }
+    else if (D == '8'){
+       D = 0b00001000;
+    }
+    else if (D == '9'){
+       D = 0b00001001;
+    }
+ 
+    return (displays + int(D));
+}
+
+//Função responsável por acender os display com os valores desejados extraidos da frequência e
+//controlar o tempo de ativação de cada display.
+//utilizou-se como tempo de ativação 1,6ms, pois um periodo completo (6,4ms) já é bem menor que 33,3ms (valor de partida para que não seja possível
+//perceber que os displays não estão acesos ao mesmo tempo)
+void mostra_rpm(){
+  if (periodo == 0){                            //espera 1,6ms
+    transmissao(val[0]);                        //chama a função que irá transmitir o valor a ser printado para o display. Note que o primeiro valor a ser transmitido
+                                                //na verdade diz respeito ao ultimo display, mas como visualmente os displays estarão acesos ao mesmo tempo
+                                                //isso não irá afetar os resultados.
+  }
+  else if (periodo == 1){                       //espera 3,2ms
+    transmissao(val[1]);                        //
+  }
+  else if (periodo == 2){                       //espera 4,8ms
+    transmissao(val[2]);                        //
+  }
+  else if (periodo == 3){                       //espera 6,4ms
+    transmissao(val[3]);                        //
+  }
+}
+
+//##################################################################################################################
+
+//Programa principal
+void loop() {
+  f= rpm();                                     //chama a função que calcula a velocidade e retorna seu valor
+  mostra_rpm();                                 //chama a função que printa o valor rpm da velocidade no display de 7 segmentos
+
+  //confirma se tem comando pronto
+  if (recebe()== 1){                            //se sim
+    recebido = 1;                               //o sinalizador 'recebido' recebe 1 indicando que algum comando pode ser executado
+  }
+
+  //verifica comando
+  if (recebido == 1){                           //se 'recebido' for 1 a string recebida pela serial será decodificada
+    //se o comando iniciar com VEL indica comando para mudar a velocidade
+    if (comando.startsWith("VEL")){
+        velo(comando);                          //chama a função para alterar a velocidade
+        recebido = 2;                           //a variável 'recebido' recebe 2 indicando que o buffer pode ser limpo
+    }
+    //se o comando for igual a VENT* indica comando para girar no modo ventilador
+    else if (comando.compareTo("VENT*")== 0){
+      if(ventilador(f) == 0){                   //chama a função para mudar para o modo ventilador verificando se o motor parou antes de realizar o movimento
+          recebido = 2;                         //se sim 'recebido' recebe 2 para limpar o buffer
+      }                                         //se não o buffer não será limpo e a função será chamada novamente para conferir se o motor parou e
+                                                //com isso alterar o sentido de rotação
+    }
+    //se o comando for igual a EXAUST* indica comando para girar no modo exaustor
+    else if (comando.compareTo("EXAUST*")== 0){
+        if(exaustor(f) == 0){                   //chama a função para mudar para o modo exaustor verificando se o motor parou antes de realizar o movimento
+          recebido = 2;                         //se sim 'recebido' recebe 2 para limpar o buffer
+      }                                         //se não o buffer não será limpo e a função será chamada novamente para conferir se o motor parou e
+                                                //com isso alterar o sentido de rotação
+    }
+    //se o comando for igual a PARA* indica comando para parar o motor
+    else if (comando.compareTo("PARA*")== 0){
+        zerar_velocidade();                     //chama a função para zerar a velocidade/parar o motor
+        recebido = 2;                           //'recebido' recebe 2 para limpar o buffer
+    }
+    //se o comando for igual a RETVEL* indica comando para para verificar o valor da velocidade
+    else if (comando.compareTo("RETVEL*")== 0){
+        mostra_velocidade(f);                   //chama a função para mostrar o valor da velocidade
+        recebido = 2;                           //'recebido' recebe 2 para limpar o buffer
+    }
+    //caso o comando não seja igual a nenhum caso anterior irá indicar comando inexistente
+    else{  
+      Serial.println("ERRO: COMANDO INEXISTENTE");
+      recebido = 2;                             //'recebido' recebe 2 para limpar o buffer
+    }
+  }
+
+  //zerar buffer
+  //se 'recebido' for igual a 2
+  if (recebido == 2){
+    comando = "";                               //buffer/comando é zerado
+    recebido = 0;                               //e 'recebido' recebe zero para que o buffer não seja zerado novamente até que outro comando
+                                                //terminado em * seja enviado ao serial
+  }
+}
