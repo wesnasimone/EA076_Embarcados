@@ -1,0 +1,108 @@
+/*#######################################################
+#                                                       #
+#          Módulo I - Memória EEPROM 24C16              #
+#                                                       #
+#     Mariane Martins                - RA:221919        #
+#     Wesna Simone Bulla de Araujo   - RA:225843        #
+#                                                       #
+#                                                       #
+#########################################################
+*/
+
+/*
+Esse módulo tem por objetivo explorar o uso dos processos
+de escrita e leitura em uma memória EEPROM 24C16 através
+do uso do protocolo I2C.
+Como exemplo foram usados como dado a ser armazenada na 
+memória o caracter '@' e como endereço de memória a 
+posição 5.
+*/
+
+//Importa bibliotecas
+#include <Wire.h>                                   //Declara biblioteca de comunicação I2C
+
+//Declaração de variáveis
+#define add_I2C 0x50                                //endereço do escravo (Interface I2C)
+unsigned char dado = '@';                           //define o caracter '@' para ser escrito na memória
+unsigned int add = 5;                               //define a posição 5 da memória que irá receber o dado a ser armazenado
+int mask = 0;                                       //define a variável para funcionar como máscara para seleção dos bits de memória
+int add_escravo = 0;                                //define endereço do protocolo I2C somado com os 3 bits mais significativos do endereço de memória
+int add_memoria = 0;                                //define variável que irá armazenar os 8 bits restantes do endereço de memória
+
+//Configurações iniciais e chamada das funções de escrita e leitura apenas uma vez 
+void setup(void)
+{
+  Serial.begin(9600);                               //Configura a taxa de transferência de bits para a comunicação serial. Ex:9600 bits por segundo
+  Wire.begin();                                     //Inicializa o barramento I2C
+
+  //chama as funções de leitura e escrita para que elas sejam chamadas apenas uma vez
+  Serial.print("Gravando o caracter ");             //mostra qual o caracter a ser enviado e em qual posição de memória (escrita)
+  Serial.print(dado);                               //
+  Serial.print(" na posicao de memoria ");          //
+  Serial.println(add);                              //
+  escrever(add,dado);                               //chama função que escreve o dado na posição de memória definida
+  delay(5);                                         //espera 5ms para que a operação de escrita seja concluida antes de chamar a função de leitura.
+  Serial.print("Na posicao de memoria ");           //mostra qual o caracter está na posição de memória definida (leitura)
+  Serial.print(add);                                //
+  Serial.print("le-se o caracter: ");               //
+  Serial.println((char) ler(add));                  //chama a função de leitura para acessar a posição de memória desejada e retorna o valor armazenado nela
+}
+
+//Seria a função principal, mas não foi utilizada para que as funções fossem chamadas apenas uma vez.
+//Por isso, optou-se por inclui-las no void setup. 
+void loop(){}
+
+//Função responsável por escrever um caracter qualquer em uma posição de memória qualquer ao receber como parâmetros:
+//add: endereço da memória em que se deseja armazenar um valor qualquer. Note que foi escolhido o tipo "unsigned int", pois o endereço de
+//memória possui 11 bits o que se adequa ao tipo int que comporta 2bytes (16 bits). Além disso, como as posições de memória são representadas por
+//apenas valores positivos utilizou-se o unsigned.
+//dado: valor a ser escrito na memória. Nesse caso foi escolhido como o tipo da variável o "unsigned char", pois diferente do endereço de memória
+//os valores que serão armazenados serão formados por 1 byte (8 bits) que é suportado pelo tipo char. Além disso, como apenas valores positivos serão considerados
+//utilizou-se o unsigned também.
+void escrever(unsigned int add, unsigned char dado)
+{
+  //preparação do endereço do escravo e do endereço de memória a ser enviado pelo barramento I2C, dado que o protocolo I2C envia apenas 8 bits
+  //por vez e o endereço de memória possui 11 bits.
+  mask = add & 0b11100000000;                         //seleciona os 3 bits mais significativos do endereço de memória de 11 bits      
+  mask = (mask>>8);                                   //desloca o resultado anterior 8 vezes para a direita tornado os 3 bits mais significativos em menos significativos
+  add_escravo = add_I2C + mask;                       //soma o endereço fixo do escravo com a mascara obtendo o novo endereço do escravo que contém partes do endereço de memória
+  add_memoria = add & 0b00011111111;                  //seleciona os 8 bits finais do endereço de memória de 11 bits
+
+
+  Wire.beginTransmission(add_escravo);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+  Wire.write(add_memoria);                            //escreve no barramento os 8 bits finais do endereço de memória, visto que os 3 primeiros bits já
+                                                      //foram embutidos no endereço do escravo enviado anteriormente.
+  Wire.write(dado);                                   //escreve no barramento o dado a ser registrado na posição de memória sinalizada anteriormente
+  Wire.endTransmission();                             //Finaliza a transmissão
+}
+
+//Função responsável por ler o conteúdo de uma posição de memória qualquer ao receber como parâmetro:
+//add: endereço da memória em que se deseja ler o conteúdo. Note que foi escolhido o tipo "unsigned int", pois o endereço de
+//memória possui 11 bits o que se adequa ao tipo int que comporta 2 bytes (16 bits). Além disso, como as posições de memória são representadas por
+//apenas valores positivos utilizou-se o unsigned.
+//Note também que a função foi declarada como "unsigned char", pois ela irá retornar o valor do dado armazenado que no geral possui 1 byte (8 bits) apenas de valores
+//positivos.
+unsigned char ler(unsigned int add)
+{
+  char dado_lido = '0';                               //define variável local que armazena o dado lido
+
+  //preparação do endereço do escravo e do endereço de memória a ser enviado pelo barramento I2C para o processo de leitura, dado que o protocolo 
+  //I2C envia apenas 8 bits por vez e o endereço de memória possui 11 bits.
+  mask = add & 0b11100000000;                         //seleciona os 3 bits mais significativos do endereço de memória de 11 bits      
+  mask = (mask>>8);                                   //desloca o resultado anterior 8 vezes para a direita tornado os 3 bits mais significativos em menos significativos
+  add_escravo = add_I2C + mask;                       //soma o endereço fixo do escravo com a mascara obtendo o novo endereço do escravo que contém partes do endereço de memória
+  add_memoria = add & 0b00011111111;                  //seleciona os 8 bits finais do endereço de memória de 11 bits
+
+
+   Wire.beginTransmission(add_escravo);               //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+   Wire.write(add_memoria);                           //escreve no barramento os 8bits finais do endereço de memória, visto que os 3 primeiros bits já
+                                                      //foram embutidos no endereço do escravo enviado anteriormente.
+   Wire.endTransmission();                            //Finaliza a transmissão
+   Wire.requestFrom(add_I2C,1);                       //Sinaliza a memoria que espera-se dado de 1 byte, passando o endereço do escravo
+
+   if (Wire.available()){                             //se houver bytes disponíveis para leitura
+     dado_lido = Wire.read();                         //lê o valor
+  }
+
+  return dado_lido;                                   //retorna o valor
+}
