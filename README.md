@@ -1,6 +1,6 @@
 # EA076_Embarcados 🤖
 
-Essa disciplina teve por finalidade desenvolver dois projetos.
+Essa disciplina teve por finalidade desenvolver dois projetos utilizando o microcontrolador Arduino UNO.
 
 ### Projeto I: Controlador de Ventilador de Teto
   
