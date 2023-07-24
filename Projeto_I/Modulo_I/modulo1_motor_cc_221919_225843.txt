@@ -1,0 +1,112 @@
+/*#######################################################
+#							#
+#	   Módulo I - Acionamento do motor CC		#
+#							#
+#	Mariane Martins 		- RA:221919	#
+#	Wesna Simone Bulla de Araujo 	- RA:225843	#
+#							#
+#########################################################
+*/
+
+/*
+Esse programa tem por objetivo controlar o sentido e velocidade
+do motor CC por meio de uma ponte H (L293D). Para isso, foram
+desenvolvidas quatro rotinas, uma associada ao giro no sentido
+horário, outra no sentido anti-horário e a terceira relacionada
+a parada do motor. A quarta função recebe como parâmetros o sentido
+e a velocidade e só então chama uma das três funções anteriores.
+A velocidade é calculada através do duty cycle (porcentagem de tempo
+que o sinal ficará em nível alto). Assim, o argumento da quarta 
+função é a porcentagem do duty cycle.
+Por fim, no loop principal do programa uma pequena rotina foi
+desenvolvida para testar os sentidos de rotação e valores de
+duty cycle.
+*/
+
+//Declaração de variáveis e definição de pinos
+#define velocidade 3 							//Define o pino PWM que irá controlar a velocidade do motor (ligado ao enable1,2 do L293D)  
+#define E1 4    							//Define a entrada 1 da ponte H 
+#define E2 7    							//Define a entrada 2 da ponte H
+
+char dir;								//Define variável relacionada ao sentido de rotação do motor
+int duty = 0;								//Inicializa variável relacionada a porcentagem de duty cycle em zero.
+float tensao = 0;							//Inicializa variável relacionada a tensão/velocidade do motor em zero.
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup()
+{  
+    pinMode(velocidade, OUTPUT);					//Declara pino PWM como saída, pois ele irá receber os novos valores de tensão calculados através do duty cycle.
+    pinMode(E1, OUTPUT);						//Declara entrada 1 da ponte H como saída, pois ela irá receber nível lógico zero ou 1 
+    pinMode(E2, OUTPUT);						//Declara entrada 2 da ponte H como saída, pois ela irá receber nível lógico zero ou 1, que combinada
+  									//com a configuração de E1 irá decidir o sentido de rotação do motor.
+}
+
+//Modularização das rotinas que controlam o sentido de rotação do motor
+
+//1- Função responsável por controlar o giro do motor no sentido anti-horário
+void giro_antihorario(){
+    digitalWrite(E1,LOW);						//Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,HIGH);						//Atribui a entrada 2 da ponte H o nível lógico 1
+}
+
+//2- Função responsável por controlar o giro do motor no sentido horário
+void giro_horario(){
+    digitalWrite(E1,HIGH);						//Atribui a entrada 1 da ponte H o nível lógico 1
+    digitalWrite(E2,LOW);  						//Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+//3- Função responsável por parar o motor
+void para_motor(){
+    digitalWrite(E1,LOW);						//Atribui a entrada 1 da ponte H o nível lógico 0
+    digitalWrite(E2,LOW);						//Atribui a entrada 2 da ponte H o nível lógico 0
+}
+
+//4- Função que modifica o sentido do giro e o valor da velocidade do motor ao receber como parâmetros
+//dir: direção do giro
+//duty: porcentagem do duty cycle
+void motor(char dir, int duty){
+ 
+  tensao = (duty*255.0)/100.0;						//Variável recebe o valor de tensão associado ao duty cycle escolhido.
+  									//Basicamente essa equação calcula a largura que o sinal PWM terá em nível alto
+  									//levando em consideração a porcentagem (duty cycle) em relação ao nível alto (255V).
+ 
+  analogWrite(velocidade, (int) tensao);				//Escreve o novo valor de tensão calculado no pino PWM. Note que a conversão para um valor
+  									//inteiro foi dada só depois do término da conta para evitar aproximações erradas.
+ 
+  //De acordo com o caracter dir o motor gira para um sentido
+  switch (dir){
+    
+    //Se dir = 'r' chama a função girar no sentido horário e depois sai da função retornando imediatamente para o código principal
+    case 'r': 
+      	giro_horario();
+      	break;
+    
+   //Se dir = 'l' chama a função girar no sentido anti-horário e depois sai da função retornando imediatamente para o código principal
+    case 'l':
+      	giro_antihorario();
+      	break;
+   
+    //Se dir = 's' chama a função para parar o motor e depois sai da função retornando imediatamente para o código principal
+    case 's': 
+      	para_motor();
+      	break;
+   
+    //Se nenhum dos caracteres anteriores for usado não faz nada e volta para o código principal
+    default:
+      	break;  
+  }     
+}
+
+//Código principal
+void loop()
+{ 
+  	motor('r',50);							//Chama função que faz o motor girar no sentido horário com duty cycle de 50%
+  	_delay_ms(2000);						//Espera 2s
+  	motor('s',100);							//Chama função que faz o motor parar com duty cycle de 100%, para deixar o Enable habilitado (parada rápida)
+  	_delay_ms(1000);						//Espera 1s
+  	motor('l',90);							//Chama função que faz o motor girar no sentido anti-horário com duty cycle de 90%
+  	_delay_ms(3000);						//Espera 3s
+  	motor('s',100);							//Chama função que faz o motor parar com duty cycle de 100%, para deixar o Enable habilitado (parada rápida)
+  	_delay_ms(1000);						//Espera 1s e o programa repete
+
+}
