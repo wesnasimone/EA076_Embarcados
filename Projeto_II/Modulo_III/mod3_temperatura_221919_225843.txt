@@ -1,0 +1,233 @@
+/*#######################################################
+#                                                       #
+#        Módulo III - Sensor de temperatura LM35        #
+#                                                       #
+#     Mariane Martins                - RA:221919        #
+#     Wesna Simone Bulla de Araujo   - RA:225843        #
+#                                                       #
+#                                                       #
+#########################################################
+*/
+
+/*
+Esse módulo tem por objetivo explorar o uso de transdutores
+analógicos, em especial os que convertem tensão em temperatura.
+Assim, foi implementado um programa que mostra em um display de
+sete segmentos valores de temperatura ambiente coletados
+por meio do sensor de temperatura LM35. Além disso, o 
+programa inclui o uso do expansor de portas PCF8574, 
+e de comunicação via protocolo I2C.
+
+A seguir a equação que define a relação entre tensão e temperatura
+
+T = ((1.1 * adc)/1024)/0.01
+
+em que
+
+T = temperatura
+1.1 = valor de referência de tensão utilizado (tensão máxima da faixa de 0 a 1.1V)
+adc = cadeia binária lida da saída do pino analógico do sensor LM35 (conversor ADC)
+1024 = quantidade de níveis entre 0 e 1.1V (10 bits)
+0.01 = define a relação entre tensão e temperatura (1°C --> 10 mV)
+*/
+
+
+//Importa bibliotecas
+#include <Wire.h>                               //Declara biblioteca de comunicação I2C
+
+//Declaração de variáveis
+#define temp A3                                 //Define pino relacionado a saída do sensor de temperatura LM35
+
+volatile int tempo = 0;                         //Define variável contador de tempo que também será utilizada dentro da interrupção. Inicializa variável em zero.
+volatile int periodo = 0;                       //Define variável para auxiliar na temporização do tempo de ativação dos displays
+int adc = 0;                                    //Define variável que irá receber o valor de leitura do sensor de temperatura. Inicializa a variável em zero.
+float V = 0.0;                                  //Define variável que irá receber o valor da tensão correspondente a temperatura medida. Inicializa a variável em zero.
+float temperatura = 0.0;                        //Define variável que irá receber o valor da temperatura a ser mostrada no display de sete segmentos. Inicializa a variável em zero.
+
+//Configura display de 7 segmentos e armazena em um vetor --> qual display será aceso?
+unsigned int display1 = 0b01110000;
+unsigned int display2 = 0b10110000;
+unsigned int display3 = 0b11010000;
+unsigned int display4 = 0b11100000;
+unsigned int display_seg[] = {display1, display2, display3, display4};
+
+int displays = 0;                               //Define variável que irá receber o código para acionar o display
+int count = 0;                                  //Define variavel para auxiliar no print do display
+String D = "0";                                 //Define variável do tipo string para separar os digitos recebidos pela temperatura
+int val[4] = {0, 0, 0, 0};                      //Define variável que irá armazenar a combinação do display e do digito a ser printado
+int c = 0;                                      //Define váriavel auxíliar;
+
+
+//Configurações iniciais --> declaração de entrada/saída para cada pino
+void setup() {
+  Serial.begin(9600);                           //Configura a taxa de transferência de bits para a comunicação serial. Ex:9600 bits por segundo
+  analogReference(INTERNAL);                    //Configura como tensão de referência do Arduino 1.1 V
+                                                //Note que um novo valor de referência foi escolhido (diferente do clássico 5V) para aumentar a 
+                                                //resolução das medições. Afinal para medições de temperatura ambiente espera-se que no máximo seja medido
+                                                //algo próximo de 40 graus o que é atendido pela faixa de 0 a 1.1 V (1.1V corresponde a 110 graus).
+                                                
+   cli();                                       //Desabilita as interrupções
+   configuracao_Timer0();                       //Configura o temporizador 
+   sei();                                       //Habilita as interrupções
+   Wire.begin();                                //Inicializa o barramento I2C
+}
+
+//Função responsável pela configuração da interrupção por TIMER
+void configuracao_Timer0(){
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Configuracao Temporizador 0 (8 bits) para gerar interrupcoes periodicas a cada 1.6ms no modo Clear Timer on Compare Match (CTC)
+  // Relogio = 16e6 Hz
+  // Prescaler = 1024
+  // Faixa = 25 (contagem de 0 a OCR0A = 24)
+  // Intervalo entre interrupcoes: (Prescaler/Relogio)*Faixa = (1024/16e6)*(24+1) = 1.6ms
+ 
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 24;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+ 
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    1
+  TCCR0B = 0x05;
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+
+// Rotina de interrupção por TIMER:
+//A cada 1.6ms o programa principal é desviado para essa rotina que incrementa o contador tempo
+//Basicamente ao multiplicar o valor desse contador com o tempo de interrupção (1.6ms) tem-se o valor do tempo transcorrido.
+ISR(TIMER0_COMPA_vect){
+  tempo++;                                  //Incrementa contador de tempo relacionado ao tempo de medição da temperatura
+  periodo++;                                //Incrementa contador de tempo relacionado ao calculo de tempo de ativação dos displays de sete segmentos
+
+  //Para garantir que os displays sempre fiquem acesos a variável periodo é zerada assim que atinge o valor 4, visto que há 4 displays (0, 1, 2, 3)
+  //e que estamos considerando um intervalo de ativação de 1,6ms (mesmo valor da interrupção por temporizador)
+  if(periodo == 4){
+    periodo = 0;    
+  }
+}
+
+
+//Expansor de portas I2C
+//##################################################################################################################
+
+//Função responsável pela transmissão I2C para o display de 7 segmentos
+//val: valor a ser enviado pelo protocolo
+void transmissao(int val){
+    Wire.beginTransmission(32);                //Indica para o mestre (arduino) o endereço do escravo (Interface I2C) com o qual ele irá se comunicar
+                                               //Nesse caso foi utilizado o valor 32, pois corresponde a configuração das entradas A2=0 A1=0 A0=0 da interface I2C
+                                               //conforme o datasheet do CI PCF8574. Além disso, inicializa a transmissão (bit de início)
+
+    Wire.write(val);                           //Envia de fato o dado desejado
+    Wire.endTransmission();                    //Finaliza a transmissão com o envio do bit de parada
+}
+//##################################################################################################################
+
+
+//Acionamento de display via protocolo I2C
+//##################################################################################################################
+
+//Função responsável por converter um caracter em valor binário inteiro
+//e combinar (somar) com o correto display ao receber como parâmetros
+//display: codigo que identifica o correto display
+//D: digito a ser combinado com o código do display
+//A função retorna o valor a ser enviado pelo protocolo I2C
+int sete_segmento(int displays, char D){
+    if (D == '0' ){
+      D = 0b00000000;
+    }
+    else if (D == '1'){
+      D = 0b00000001;
+    }
+    else if (D == '2'){
+       D = 0b00000010;
+    }
+     else if (D == '3'){
+       D = 0b00000011;
+    }
+    else if (D == '4'){
+      D = 0b00000100;
+    }
+    else if (D == '5'){
+      D = 0b00000101;
+    }
+    else if (D == '6'){
+      D = 0b00000110;
+    }
+    else if (D == '7'){
+       D = 0b00000111;
+    }
+    else if (D == '8'){
+       D = 0b00001000;
+    }
+    else if (D == '9'){
+       D = 0b00001001;
+    }
+ 
+    return (displays + int(D));
+}
+
+//Função responsável por acender os display com os valores desejados extraidos da temperatura e
+//controlar o tempo de ativação de cada display.
+//utilizou-se como tempo de ativação 1,6ms, pois um periodo completo (6,4ms) já é bem menor que 33,3ms (valor de partida para que não seja possível
+//perceber que os displays não estão acesos ao mesmo tempo)
+void mostra_temperatura(){
+  if (periodo == 0){                            //espera 1,6ms
+    transmissao(val[0]);                        //chama a função que irá transmitir o valor a ser printado para o display. Note que o primeiro valor a ser transmitido
+                                                //na verdade diz respeito ao ultimo display, mas como visualmente os displays estarão acesos ao mesmo tempo
+                                                //isso não irá afetar os resultados.
+  }
+  else if (periodo == 1){                       //espera 3,2ms
+    transmissao(val[1]);                        //
+  }
+  else if (periodo == 2){                       //espera 4,8ms
+    transmissao(val[2]);                        //
+  }
+  else if (periodo == 3){                       //espera 6,4ms
+    transmissao(val[3]);                        //
+  }
+}
+//##################################################################################################################
+
+
+// Função que mede o valor da temperatura ambiente
+float mede_temperatura() {
+  if (tempo >= 1250){                                          //Se a contagem de tempo for maior ou igual a 1250, isto é, passaram-se 2s
+    //Atualização do valor de temperatura    
+    adc = analogRead(temp);                                    //o pino analógico do sensor de temperatura é lido (conversor ADC)
+    V = (1.1 * adc)/1024;                                      //o valor lido é convertido em tensão dentro de uma escala de 0 a 1.1V.
+    temperatura = V/(0.01);                                    //a tensão é convertida para temperatura (1°C = 10mV)
+
+    //Atualização do valor do display a cada 2s    
+    D = String(int(temperatura*100));                            //Converte a temperatura em inteiro e depois converte em string para separar os digitos.
+                                                                 //Note que a temperatura foi multiplicada por 100 para facilitar a exibição nos 4 displays de sete segmentos 
+    count = D.length() - 1;                                      //calcula o comprimento da string e subtrai um para definir o valor da última posição do vetor D
+    
+    //Para garantir que os digitos separados sejam corretamente posicionados em determinados displays
+    //combina-se o par display e digito D de modo que o último display sempre será combinado com o último elemento do vetor D,
+    //o penultimo display com o penultimo elemento e assim por diante. Isso garante que valores de frequência com menos de 4 digitos também sejam
+    //corretamente posicionados. Basicamente seria como printar no display de trás para frente.
+    for(c=3;c >= 0;c--){                                        //c = 3 pois considera a quantidade de indices dos displays disponíveis (0, 1, 2, 3)                 
+      val[c] = sete_segmento(display_seg[c], D[count]);         //chama a função que irá combinar display com digito
+      count--;                                                  //decrementa para passar para o próximo elemento de trás para frente
+    }
+
+    //As variáveis globais que também são utiizadas na interrupção são zeradas para reiniciar a contagem
+    tempo = 0;
+  }
+   return temperatura;                                          //retorna a temperatura
+}
+
+//Programa principal
+void loop() {
+  mede_temperatura();                                          //chama a função que mede a temperatura
+  mostra_temperatura();                                        //chama a função que printa o valor da temperatura no display de sete segmentos
+}
